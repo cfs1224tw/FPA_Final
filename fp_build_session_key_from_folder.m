@@ -158,13 +158,39 @@ function fp_build_session_key_from_folder(rootDir)
         OldKey.TankPath = string(OldKey.TankPath);
         nOldBefore = height(OldKey);
         OldKey = dedupe_sessionkey(OldKey);
+
+        % Refresh behavior-related fields for rows that already exist.
+        refreshVars = intersect(SessionKey.Properties.VariableNames, OldKey.Properties.VariableNames);
+        refreshVars = intersect(refreshVars, {'DateStr','BehaviorFile','BehaviorPath'});
+
+        [isExisting, locOld] = ismember(SessionKey.TankPath, OldKey.TankPath);
+        nRefreshed = 0;
+        for r = find(isExisting(:))'
+            rowChanged = false;
+            for v = 1:numel(refreshVars)
+                vn = refreshVars{v};
+                newVal = SessionKey{r, vn};
+                oldVal = OldKey{locOld(r), vn};
+                if ~isequaln(string(newVal), string(oldVal))
+                    OldKey = assign_table_value(OldKey, locOld(r), vn, newVal);
+                    rowChanged = true;
+                end
+            end
+            if rowChanged
+                nRefreshed = nRefreshed + 1;
+            end
+        end
     
         % Identify new rows (TankPath not in old)
         isNew = ~ismember(SessionKey.TankPath, OldKey.TankPath);
         AddKey = SessionKey(isNew, :);
     
         if isempty(AddKey)
-            if height(OldKey) < nOldBefore
+            if nRefreshed > 0
+                writetable(OldKey, outFile);
+                fprintf('SessionKey refreshed (%d existing rows updated):\n  %s\n', ...
+                    nRefreshed, outFile);
+            elseif height(OldKey) < nOldBefore
                 writetable(OldKey, outFile);
                 fprintf('SessionKey cleaned (removed %d duplicate rows):\n  %s\n', ...
                     nOldBefore - height(OldKey), outFile);
@@ -299,5 +325,19 @@ function T = dedupe_sessionkey(T)
 
     [~, ia] = unique(tankPath, 'stable');
     T = T(sort(ia), :);
+end
+
+function T = assign_table_value(T, rowIdx, varName, newVal)
+    col = T.(varName);
+
+    if iscell(col)
+        T.(varName){rowIdx} = char(string(newVal));
+    elseif isstring(col)
+        T.(varName)(rowIdx) = string(newVal);
+    elseif ischar(col)
+        T.(varName)(rowIdx,:) = char(string(newVal));
+    else
+        T.(varName)(rowIdx) = newVal;
+    end
 end
 end

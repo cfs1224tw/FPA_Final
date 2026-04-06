@@ -45,7 +45,7 @@ Useful entrypoints:
 
 - `Run_all.m`: build session key, process sessions, launch the population viewer
 - `fp_run_all_sessions.m`: batch-process sessions into `Results/session/`
-- `fp_run_all_sessions_FLMM_export.m`: export FLMM-ready CSV files
+- `fp_run_all_sessions_flmm.m`: export FLMM-ready CSV files for the FLMM workflow
 - `fp_plot_all_animals_tiles.m`: generate per-animal tiled plots
 - `fp_early_vs_late.m`: run early-vs-late plotting batches
 - `fp_gui_population_viewer_1214.m`: active population viewer GUI
