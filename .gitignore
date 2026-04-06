@@ -1,0 +1,26 @@
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.Rhistory
+
+# MATLAB temporary files
+*.asv
+*.autosave
+*.m~
+slprj/
+
+# Project-generated outputs and local data
+Results/
+AnimalData/
+behavior/
+metadata/
+SessionKey.xlsx
+
+# Archives / exports
+*.zip
+*.tar
+*.gz
+
+# MATLAB cache / project files
+*.mlx.autosave
+*.prj
