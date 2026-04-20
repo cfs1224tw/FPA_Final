@@ -1,6 +1,7 @@
 function test_fp_gui_population_viewer_smoke(rootDir)
 % TEST_FP_GUI_POPULATION_VIEWER_SMOKE
-% Basic regression smoke test for fp_gui_population_viewer.
+% Regression smoke test for fp_gui_population_viewer, including
+% tone/octave split modes and tiled split plotting.
 
     if nargin < 1 || isempty(rootDir)
         rootDir = fileparts(fileparts(mfilename('fullpath')));
@@ -27,6 +28,12 @@ function test_fp_gui_population_viewer_smoke(rootDir)
     cbHit = findobj(fig, 'Tag', 'cbHit');
     cbFA = findobj(fig, 'Tag', 'cbFA');
     cbTileSplit = findobj(fig, 'Tag', 'cbTileSplit');
+    editReactStart = findobj(fig, 'Tag', 'editReactStart');
+    editReactEnd = findobj(fig, 'Tag', 'editReactEnd');
+    editRewardStart = findobj(fig, 'Tag', 'editRewardStart');
+    editRewardEnd = findobj(fig, 'Tag', 'editRewardEnd');
+    tableSummary = findobj(fig, 'Tag', 'tableSummary');
+    btnExportSummary = findobj(fig, 'Tag', 'btnExportSummary');
     listSessions1 = findobj(fig, 'Tag', 'listSessions1');
     listAnimals1 = findobj(fig, 'Tag', 'listAnimals1');
     listAnimals2 = findobj(fig, 'Tag', 'listAnimals2');
@@ -37,16 +44,24 @@ function test_fp_gui_population_viewer_smoke(rootDir)
     assert(~isempty(popupSplitIdx), 'Split selection popup not found.');
     assert(~isempty(popupGroup2), 'Group 2 popup not found.');
     assert(~isempty(modeBG), 'Mode button group not found.');
+    assert(~isempty(editReactStart) && ~isempty(editReactEnd), 'React AUC window controls not found.');
+    assert(~isempty(editRewardStart) && ~isempty(editRewardEnd), 'Reward AUC window controls not found.');
+    assert(~isempty(tableSummary), 'Summary table not found.');
+    assert(~isempty(btnExportSummary), 'Export summary button not found.');
 
     set(cbAll, 'Value', 1);
     set(cbHit, 'Value', 1);
     set(cbFA, 'Value', 1);
     set(cbTileSplit, 'Value', 0);
+    set(editReactStart, 'String', '0');
+    set(editReactEnd, 'String', '1.5');
+    set(editRewardStart, 'String', '2');
+    set(editRewardEnd, 'String', '5');
     drawnow;
 
     assert(~isempty(get(listSessions1, 'String')), 'Session list is empty.');
-    assert(~isempty(get(listAnimals1, 'String')), 'Animal list for Group 1 is empty.');
-    assert(~isempty(get(listAnimals2, 'String')), 'Animal list for Group 2 is empty.');
+    assert(~isempty(get(listAnimals1, 'Data')), 'Animal list for Group 1 is empty.');
+    assert(~isempty(get(listAnimals2, 'Data')), 'Animal list for Group 2 is empty.');
 
     run_plot(btnPlot, modeBG, 'single');
     run_plot(btnPlot, modeBG, 'groupmean');
@@ -58,16 +73,38 @@ function test_fp_gui_population_viewer_smoke(rootDir)
         run_plot(btnPlot, modeBG, 'group12');
     end
 
-    set(popupSplitMode, 'Value', min(2, control_length(get(popupSplitMode, 'String'))));
+    splitModeItems = get_as_cellstr(get(popupSplitMode, 'String'));
+    assert(any(strcmp(splitModeItems, 'Tone (1..7)')), 'Tone split mode was not populated.');
+    assert(any(strcmp(splitModeItems, 'Symmetric Octave (4 bins)')), 'Octave split mode was not populated.');
+
+    set(popupSplitMode, 'Value', find(strcmp(splitModeItems, 'Tone (1..7)'), 1, 'first'));
     fire_callback(popupSplitMode);
     drawnow;
-    set(popupSplitIdx, 'Value', min(2, control_length(get(popupSplitIdx, 'String'))));
+
+    toneItems = get_as_cellstr(get(popupSplitIdx, 'String'));
+    assert(control_length(toneItems) >= 8, 'Tone split index popup did not populate all tone bins.');
+    set(popupSplitIdx, 'Value', 2);
     drawnow;
     run_plot(btnPlot, modeBG, 'single');
+
+    aucSummary = get(tableSummary, 'Data');
+    assert(~isempty(aucSummary), 'AUC summary table did not populate after plotting.');
 
     set(cbTileSplit, 'Value', 1);
     drawnow;
     run_plot(btnPlot, modeBG, 'groupmean');
+    assert(count_plot_axes(fig) >= 7, 'Tone tiled mode did not render the expected number of plot axes.');
+
+    set(popupSplitMode, 'Value', find(strcmp(splitModeItems, 'Symmetric Octave (4 bins)'), 1, 'first'));
+    fire_callback(popupSplitMode);
+    drawnow;
+    octaveItems = get_as_cellstr(get(popupSplitIdx, 'String'));
+    assert(control_length(octaveItems) >= 5, 'Octave split index popup did not populate all octave bins.');
+    set(popupSplitIdx, 'Value', 2);
+    set(cbTileSplit, 'Value', 1);
+    drawnow;
+    run_plot(btnPlot, modeBG, 'groupmean');
+    assert(count_plot_axes(fig) >= 4, 'Octave tiled mode did not render the expected number of plot axes.');
 
     [warnMsg, warnId] = lastwarn;
     assert(isempty(warnMsg), 'Viewer emitted warning: %s (%s)', warnMsg, warnId);
@@ -106,6 +143,33 @@ function n = control_length(items)
         n = numel(items);
     else
         n = numel(items);
+    end
+end
+
+function items = get_as_cellstr(rawItems)
+    if iscell(rawItems)
+        items = rawItems;
+    elseif isstring(rawItems)
+        items = cellstr(rawItems);
+    elseif ischar(rawItems)
+        items = cellstr(rawItems);
+    else
+        items = cellstr(string(rawItems));
+    end
+end
+
+function n = count_plot_axes(fig)
+    allAxes = findall(fig, 'Type', 'axes');
+    n = 0;
+    for ii = 1:numel(allAxes)
+        tag = '';
+        try
+            tag = get(allAxes(ii), 'Tag');
+        catch
+        end
+        if isempty(tag) || ~strcmpi(tag, 'legend')
+            n = n + 1;
+        end
     end
 end
 
