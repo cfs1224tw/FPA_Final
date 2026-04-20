@@ -1,1305 +1,1820 @@
-    function fp_gui_population_viewer(rootDir)
-% FP_GUI_POPULATION_VIEWER (FINAL)
-% - Context-based group viewer
-% - Modes: Single / Group mean / Group1 vs Group2
-% - Trace types: All / Hit / FA
-% - Manual axes (no auto reset)
-% - Align all traces so y(t=0)=0
-% - Single session: NO across-session SEM
-% - Save: exportgraphics(main plot only)
-% - Color pickers for Group1/Group2 + Reset
-% - Split mode:
-%     1) All trials
-%     2) Tone (1..7) + All
-%     3) Symmetric Octave (4 bins) + All, built from Tone pairs:
-%           Oct1: tones 1&7
-%           Oct2/3: tones 2&6
-%           Oct1/3: tones 3&5
-%           Oct0: tone 4
-% - Tile split bins:
-%     * Tone mode -> 7 tiles (always show all 7 bins)
-%     * Octave mode -> 4 tiles (always show all 4 bins)
+function fp_gui_population_viewer(rootDir)
+% FP_GUI_POPULATION_VIEWER
+% Interactive viewer for fiber photometry population traces.
+%
+% Rebuilt entrypoint for the current repo layout:
+%   - loads processed session outputs from Results/session/sub_*.mat
+%   - groups sessions with fp_build_context_groups
+%   - supports single-session, group-mean, and group-vs-group plotting
+%   - computes quick AUC summaries over user-defined reaction/reward windows
 
     clc;
+
     if nargin < 1 || isempty(rootDir)
-        rootDir = '/Users/foxking/Desktop/FPA_Final';
+        rootDir = fileparts(mfilename('fullpath'));
     end
 
-    % ---------------- 1) Collect sessions and build context groups ----------------
     [allSubs, ~] = fp_collect_all_sub(rootDir);
     if isempty(allSubs)
-        error('fp_gui_population_viewer_tone_1216:NoSubs', 'No sessions found.');
+        error('fp_gui_population_viewer:NoSubs', ...
+            'No processed sessions found under %s.', fullfile(rootDir, 'Results', 'session'));
     end
 
     [ctxGroups, groupNames] = fp_build_context_groups(allSubs);
     if isempty(groupNames)
-        error('fp_gui_population_viewer_tone_1216:NoContextGroups', 'No context-based groups found.');
+        error('fp_gui_population_viewer:NoContextGroups', ...
+            'No context-based groups were built from the processed sessions.');
     end
 
-    groupNames  = cellstr(groupNames(:));
-    groupNames2 = [{'<none>'}; groupNames(:)];
+    groupNames = cellstr(groupNames(:));
+    canonKey = @(k) canonical_group_key(k);
+    keyField = @(k) matlab.lang.makeValidName(canonKey(k));
 
-    canonKey = @(k) strtrim(char(string(k)));
-    keyField = @(k) matlab.lang.makeValidName(canonKey(k)); % for struct field
-
-    % Reference time base (from first group)
-    firstKey = canonKey(groupNames{1});
-    tRef = ctxGroups.(firstKey)(1).t(:)'; % row
-
+    tRef = ctxGroups.(canonKey(groupNames{1}))(1).t(:)';
     defaultXLim = [-2 10];
     defaultYLim = [-1.5 0.5];
+    groupNames2 = [{'<none>'}; groupNames(:)];
 
-    % ---------------- 2) Build GUI figure and controls ----------------
+    state = struct();
+    state.currentXLim = defaultXLim;
+    state.currentYLim = defaultYLim;
+    state.manualAxes = false;
+    state.lastSummaryHeaders = {};
+    state.lastSummaryData = {};
+
     fig = figure('Name', 'FP Population Viewer', ...
-        'NumberTitle', 'off', 'Color', 'w', ...
-        'Units', 'normalized', 'Position', [0.05 0.05 0.9 0.85]);
+        'NumberTitle', 'off', ...
+        'Color', 'w', ...
+        'Units', 'normalized', ...
+        'Position', [0.04 0.06 0.92 0.86]);
 
-    % --- Container panel ---
-    mainPanel = uipanel('Parent', fig, ...
-        'Units','normalized', ...
-        'Position',[0.31 0.10 0.48 0.80], ...
-        'BorderType','none', ...
-        'BackgroundColor','w');
-    
-    % --- Axes with safe margins ---
-    axMargin = struct( ...
-        'left',   0.10, ...  % leave room for ylabel
-        'bottom', 0.10, ...  % leave room for xlabel
-        'right',  0.03, ...
-        'top',    0.06);     % leave room for title
-    
-    mainAx = axes('Parent', mainPanel, ...
-        'Units','normalized', ...
-        'Position',[
-            axMargin.left, ...
-            axMargin.bottom, ...
-            1 - axMargin.left - axMargin.right, ...
-            1 - axMargin.bottom - axMargin.top], ...
-        'ActivePositionProperty','position');
-    
-    hold(mainAx,'on'); box(mainAx,'on'); grid(mainAx,'on');
-    
-    xlabel(mainAx,'Time (s)');
-    ylabel(mainAx,'z (baseline-centered; aligned at t=0)');
-    title(mainAx,'FP traces');
-    
-    mainAx.XLim = defaultXLim;
-    mainAx.YLim = defaultYLim;
-    set(mainAx,'XLimMode','manual','YLimMode','manual');
-
-    % ---------- Top-right: Trace type checkboxes ----------
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.92 0.18 0.035], 'String', 'Trace type', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    cbAll = uicontrol(fig, 'Style', 'checkbox', 'Units', 'normalized', ...
-        'Position', [0.80 0.885 0.06 0.04], 'String', 'All', 'BackgroundColor', 'w', 'Value', 0, ...
-        'Tag', 'cbAll');
-    cbHit = uicontrol(fig, 'Style', 'checkbox', 'Units', 'normalized', ...
-        'Position', [0.87 0.885 0.06 0.04], 'String', 'Hit', 'BackgroundColor', 'w', 'Value', 1, ...
-        'Tag', 'cbHit');
-    cbFA  = uicontrol(fig, 'Style', 'checkbox', 'Units', 'normalized', ...
-        'Position', [0.94 0.885 0.05 0.04], 'String', 'FA',  'BackgroundColor', 'w', 'Value', 1, ...
-        'Tag', 'cbFA');
-
-    % ---------- Split mode controls ----------
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.84 0.18 0.035], 'String', 'Split mode', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    popupSplitMode = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', ...
-        'Position', [0.80 0.81 0.18 0.035], ...
-        'String', {'All trials', 'Tone (1..7)', 'Symmetric Octave (4 bins)'}, ...
-        'BackgroundColor', 'w', 'Callback', @onSplitModeChanged, ...
-        'Tag', 'popupSplitMode');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.77 0.18 0.03], 'String', 'Split selection', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    popupSplitIdx = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', ...
-        'Position', [0.80 0.74 0.18 0.035], ...
-        'String', {'All'}, 'BackgroundColor', 'w', 'Tag', 'popupSplitIdx');
-
-    cbTileSplit = uicontrol(fig, 'Style','checkbox', 'Units','normalized', ...
-        'Position',[0.80 0.705 0.18 0.035], ...
-        'String','Tile split bins', 'Value',0, 'BackgroundColor','w', 'Tag', 'cbTileSplit');
-
-    % ---------- Axes settings ----------
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.67 0.18 0.035], ...
-        'String', 'Axes limits [Xmin Xmax; Ymin Ymax]', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.645 0.04 0.03], 'String', 'X:', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    editXmin = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
-        'Position', [0.84 0.645 0.06 0.035], 'String', num2str(defaultXLim(1)), 'BackgroundColor', 'w');
-    editXmax = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
-        'Position', [0.91 0.645 0.07 0.035], 'String', num2str(defaultXLim(2)), 'BackgroundColor', 'w');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.80 0.6 0.04 0.03], 'String', 'Y:', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    editYmin = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
-        'Position', [0.84 0.6 0.06 0.035], 'String', num2str(defaultYLim(1)), 'BackgroundColor', 'w');
-    editYmax = uicontrol(fig, 'Style', 'edit', 'Units', 'normalized', ...
-        'Position', [0.91 0.6 0.07 0.035], 'String', num2str(defaultYLim(2)), 'BackgroundColor', 'w');
-
-    btnApplyAxes = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.80 0.54 0.18 0.045], 'String', 'Apply Axes', 'Callback', @onApplyAxes);
-
-    % ---------- Color controls ----------
-    btnColorG1 = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.80 0.5 0.085 0.04], 'String', 'Pick G1', 'Callback', @onPickColorG1);
-    btnColorG2 = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.895 0.5 0.085 0.04], 'String', 'Pick G2', 'Callback', @onPickColorG2);
-    btnResetColors = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.80 0.45 0.18 0.04], 'String', 'Reset Colors', 'Callback', @onResetColors);
-
-    % ---------- Plot / Save ----------
-    btnPlot = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.80 0.40 0.18 0.055], 'String', 'Plot', 'FontWeight', 'bold', 'Callback', @onPlot, ...
-        'Tag', 'btnPlot');
-    btnSave = uicontrol(fig, 'Style', 'pushbutton', 'Units', 'normalized', ...
-        'Position', [0.80 0.34 0.18 0.055], 'String', 'Save Figure...', 'Callback', @onSaveFigure);
-
-    % ---------- Left panel: Group selection ----------
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.02 0.90 0.25 0.035], 'String', 'Group 1 (Genotype_Region_Context)', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    popupGroup1 = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', ...
-        'Position', [0.02 0.86 0.25 0.04], 'String', groupNames, 'BackgroundColor', 'w', ...
-        'Callback', @onGroup1Changed, 'Tag', 'popupGroup1');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.02 0.82 0.25 0.03], 'String', 'Sessions in Group 1 (Single / optional subset)', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    listSessions1 = uicontrol(fig, 'Style', 'listbox', 'Units', 'normalized', ...
-        'Position', [0.02 0.64 0.25 0.18], 'Max', 2, 'Min', 0, 'BackgroundColor', 'w', ...
-        'Tag', 'listSessions1');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.02 0.60 0.25 0.03], 'String', 'Animals in Group 1 (subset for Group mean / Group12)', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    listAnimals1 = uicontrol(fig, 'Style', 'listbox', 'Units', 'normalized', ...
-        'Position', [0.02 0.50 0.25 0.10], 'Max', 2, 'Min', 0, 'BackgroundColor', 'w', ...
-        'Tag', 'listAnimals1');
-
-    modeBG = uibuttongroup(fig, 'Units', 'normalized', 'Position', [0.02 0.35 0.25 0.13], ...
-        'Title', 'Mode', 'BackgroundColor', 'w');
-
-    rbSingle    = uicontrol(modeBG, 'Style', 'radiobutton', 'Units', 'normalized', ...
-        'Position', [0.05 0.66 0.9 0.30], 'String', 'Single session', 'Tag', 'single', 'BackgroundColor', 'w');
-    rbGroupMean = uicontrol(modeBG, 'Style', 'radiobutton', 'Units', 'normalized', ...
-        'Position', [0.05 0.36 0.9 0.30], 'String', 'Group mean', 'Tag', 'groupmean', 'BackgroundColor', 'w');
-    rbGroup12   = uicontrol(modeBG, 'Style', 'radiobutton', 'Units', 'normalized', ...
-        'Position', [0.05 0.06 0.9 0.30], 'String', 'Group 1 vs Group 2', 'Tag', 'group12', 'BackgroundColor', 'w');
-    modeBG.SelectedObject = rbSingle;
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.02 0.30 0.25 0.03], 'String', 'Group 2 (for comparison)', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    popupGroup2 = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', ...
-        'Position', [0.02 0.26 0.25 0.04], 'String', groupNames2, 'BackgroundColor', 'w', ...
-        'Callback', @onGroup2Changed, 'Tag', 'popupGroup2');
-
-    uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
-        'Position', [0.02 0.22 0.25 0.03], 'String', 'Animals in Group 2 (subset for Group12)', ...
-        'HorizontalAlignment', 'left', 'BackgroundColor', 'w');
-
-    listAnimals2 = uicontrol(fig, 'Style', 'listbox', 'Units', 'normalized', ...
-        'Position', [0.02 0.10 0.25 0.12], 'Max', 2, 'Min', 0, 'BackgroundColor', 'w', ...
-        'Tag', 'listAnimals2');
-
-    % ---------- State ----------
-    manualAxes  = false;
-    currentXLim = defaultXLim;
-    currentYLim = defaultYLim;
-
-    LW.single = 1.5;
-    LW.group  = 2.0;
-
-    % ---------- Color maps (AUTO + USER OVERRIDE) ----------
-    autoColorMap  = build_group_color_map(groupNames);
-    setappdata(fig, 'autoColorMap',  autoColorMap);
+    autoColorMap = build_group_color_map(groupNames);
+    setappdata(fig, 'autoColorMap', autoColorMap);
     setappdata(fig, 'groupColorMap', autoColorMap);
 
-    % init
-    onSplitModeChanged();
+    plotPanel = uipanel(fig, ...
+        'Units', 'normalized', ...
+        'Position', [0.30 0.05 0.51 0.89], ...
+        'BackgroundColor', 'w', ...
+        'BorderType', 'none');
+
+    rightPanel = uipanel(fig, ...
+        'Units', 'normalized', ...
+        'Position', [0.82 0.05 0.16 0.89], ...
+        'BackgroundColor', 'w', ...
+        'BorderType', 'none');
+
+    mainAxes = build_plot_axes(1);
+
+    uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.90 0.25 0.03], ...
+        'String', 'Group 1 (Genotype_Region_Context)', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    popupGroup1 = uicontrol(fig, 'Style', 'popupmenu', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.86 0.25 0.04], ...
+        'String', groupNames, ...
+        'BackgroundColor', 'w', ...
+        'Callback', @onGroup1Changed);
+
+    uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.82 0.12 0.03], ...
+        'String', 'Sessions', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    listSessions1 = uicontrol(fig, 'Style', 'listbox', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.62 0.25 0.20], ...
+        'Max', 999, ...
+        'Min', 0, ...
+        'Tag', 'listSessions1', ...
+        'BackgroundColor', 'w', ...
+        'Callback', @onSplitModeChanged);
+
+    uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.58 0.12 0.03], ...
+        'String', 'Animals (G1)', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    listAnimals1 = uitable(fig, ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.43 0.25 0.15], ...
+        'Tag', 'listAnimals1', ...
+        'BackgroundColor', 'w', ...
+        'Data', cell(0, 2), ...
+        'ColumnName', {'Use', 'Animal'}, ...
+        'ColumnEditable', [true false], ...
+        'ColumnFormat', {'logical', 'char'}, ...
+        'RowName', []);
+
+    modeBG = uibuttongroup(fig, ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.29 0.25 0.12], ...
+        'Title', 'Mode', ...
+        'BackgroundColor', 'w');
+
+    rbSingle = uicontrol(modeBG, 'Style', 'radiobutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.05 0.67 0.9 0.25], ...
+        'String', 'Single session', ...
+        'Tag', 'single', ...
+        'BackgroundColor', 'w');
+
+    rbGroupMean = uicontrol(modeBG, 'Style', 'radiobutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.05 0.37 0.9 0.25], ...
+        'String', 'Group mean', ...
+        'Tag', 'groupmean', ...
+        'BackgroundColor', 'w');
+
+    rbGroup12 = uicontrol(modeBG, 'Style', 'radiobutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.05 0.07 0.9 0.25], ...
+        'String', 'Group 1 vs Group 2', ...
+        'Tag', 'group12', ...
+        'BackgroundColor', 'w');
+
+    modeBG.SelectedObject = rbGroup12;
+
+    uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.25 0.25 0.03], ...
+        'String', 'Group 2 (comparison)', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    popupGroup2 = uicontrol(fig, 'Style', 'popupmenu', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.21 0.25 0.04], ...
+        'String', groupNames2, ...
+        'Tag', 'popupGroup2', ...
+        'BackgroundColor', 'w', ...
+        'Value', min(2, numel(groupNames2)), ...
+        'Callback', @onGroup2Changed);
+
+    uicontrol(fig, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.17 0.12 0.03], ...
+        'String', 'Animals (G2)', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    listAnimals2 = uitable(fig, ...
+        'Units', 'normalized', ...
+        'Position', [0.02 0.04 0.25 0.13], ...
+        'Tag', 'listAnimals2', ...
+        'BackgroundColor', 'w', ...
+        'Data', cell(0, 2), ...
+        'ColumnName', {'Use', 'Animal'}, ...
+        'ColumnEditable', [true false], ...
+        'ColumnFormat', {'logical', 'char'}, ...
+        'RowName', []);
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.95 0.88 0.04], ...
+        'String', 'Trace Types', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    cbAll = uicontrol(rightPanel, 'Style', 'checkbox', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.91 0.26 0.04], ...
+        'String', 'All', ...
+        'Tag', 'cbAll', ...
+        'Value', 0, ...
+        'BackgroundColor', 'w');
+
+    cbHit = uicontrol(rightPanel, 'Style', 'checkbox', ...
+        'Units', 'normalized', ...
+        'Position', [0.36 0.91 0.26 0.04], ...
+        'String', 'Hit', ...
+        'Tag', 'cbHit', ...
+        'Value', 1, ...
+        'BackgroundColor', 'w');
+
+    cbFA = uicontrol(rightPanel, 'Style', 'checkbox', ...
+        'Units', 'normalized', ...
+        'Position', [0.66 0.91 0.26 0.04], ...
+        'String', 'FA', ...
+        'Tag', 'cbFA', ...
+        'Value', 1, ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.84 0.88 0.04], ...
+        'String', 'Split / Filter', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    popupSplitMode = uicontrol(rightPanel, 'Style', 'popupmenu', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.80 0.88 0.05], ...
+        'String', {'All trials', 'Tone (1..7)', 'Symmetric Octave (4 bins)'}, ...
+        'Tag', 'popupSplitMode', ...
+        'BackgroundColor', 'w', ...
+        'Callback', @onSplitModeChanged);
+
+    popupSplitIdx = uicontrol(rightPanel, 'Style', 'popupmenu', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.74 0.88 0.05], ...
+        'String', {'All selected'}, ...
+        'Tag', 'popupSplitIdx', ...
+        'BackgroundColor', 'w');
+
+    cbTileSplit = uicontrol(rightPanel, 'Style', 'checkbox', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.69 0.88 0.04], ...
+        'String', 'Tile split groups', ...
+        'Tag', 'cbTileSplit', ...
+        'Value', 0, ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.63 0.88 0.04], ...
+        'String', 'Axes [Xmin Xmax ; Ymin Ymax]', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.59 0.08 0.04], ...
+        'String', 'X', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    editXmin = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.16 0.59 0.26 0.045], ...
+        'String', num2str(defaultXLim(1)), ...
+        'BackgroundColor', 'w');
+
+    editXmax = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.48 0.59 0.26 0.045], ...
+        'String', num2str(defaultXLim(2)), ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.54 0.08 0.04], ...
+        'String', 'Y', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    editYmin = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.16 0.54 0.26 0.045], ...
+        'String', num2str(defaultYLim(1)), ...
+        'BackgroundColor', 'w');
+
+    editYmax = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.48 0.54 0.26 0.045], ...
+        'String', num2str(defaultYLim(2)), ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.76 0.54 0.18 0.095], ...
+        'String', 'Apply', ...
+        'Callback', @onApplyAxes);
+
+    uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.495 0.40 0.04], ...
+        'String', 'Pick G1', ...
+        'Callback', @onPickColorG1);
+
+    uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.54 0.495 0.40 0.04], ...
+        'String', 'Pick G2', ...
+        'Callback', @onPickColorG2);
+
+    uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.455 0.88 0.04], ...
+        'String', 'Reset Colors', ...
+        'Callback', @onResetColors);
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.405 0.88 0.04], ...
+        'String', 'AUC Windows', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.365 0.36 0.04], ...
+        'String', 'React [s]', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    editReactStart = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.46 0.365 0.20 0.045], ...
+        'String', '0', ...
+        'Tag', 'editReactStart', ...
+        'BackgroundColor', 'w');
+
+    editReactEnd = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.72 0.365 0.20 0.045], ...
+        'String', '2', ...
+        'Tag', 'editReactEnd', ...
+        'BackgroundColor', 'w');
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.315 0.36 0.04], ...
+        'String', 'Reward [s]', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    editRewardStart = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.46 0.315 0.20 0.045], ...
+        'String', '2', ...
+        'Tag', 'editRewardStart', ...
+        'BackgroundColor', 'w');
+
+    editRewardEnd = uicontrol(rightPanel, 'Style', 'edit', ...
+        'Units', 'normalized', ...
+        'Position', [0.72 0.315 0.20 0.045], ...
+        'String', '5', ...
+        'Tag', 'editRewardEnd', ...
+        'BackgroundColor', 'w');
+
+    btnPlot = uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.245 0.40 0.055], ...
+        'String', 'Plot', ...
+        'Tag', 'btnPlot', ...
+        'FontWeight', 'bold', ...
+        'Callback', @onPlot);
+
+    uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.54 0.245 0.40 0.055], ...
+        'String', 'Save Figure...', ...
+        'Callback', @onSaveFigure);
+
+    uicontrol(rightPanel, 'Style', 'text', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.195 0.88 0.04], ...
+        'String', 'Summary', ...
+        'HorizontalAlignment', 'left', ...
+        'BackgroundColor', 'w');
+
+    tableSummary = uitable(rightPanel, ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.045 0.88 0.145], ...
+        'Tag', 'tableSummary', ...
+        'Data', {}, ...
+        'ColumnName', {'Scope', 'Split', 'Group', 'Outcome', 'NSess', 'NTrial', 'ReactAUC', 'RewardAUC'});
+
+    btnExportSummary = uicontrol(rightPanel, 'Style', 'pushbutton', ...
+        'Units', 'normalized', ...
+        'Position', [0.06 0.005 0.88 0.03], ...
+        'String', 'Export Summary CSV...', ...
+        'Tag', 'btnExportSummary', ...
+        'Callback', @onExportSummary);
+
+    defaultGroup1Idx = find_group_index(groupNames, 'WT_AUX_CleanOnly');
+    if ~isempty(defaultGroup1Idx)
+        set(popupGroup1, 'Value', defaultGroup1Idx);
+    end
+
+    defaultGroup2Idx = find_group_index(groupNames2, 'FX_AUX_CleanOnly');
+    if ~isempty(defaultGroup2Idx)
+        set(popupGroup2, 'Value', defaultGroup2Idx);
+    end
+
     onGroup1Changed();
     onGroup2Changed();
 
-    % ============================ Callbacks ============================
-
-    function onSplitModeChanged(~, ~)
-        sanitize_popup_value(popupSplitMode);
-        m = popupSplitMode.Value;
-        switch m
-            case 1 % All
-                set(popupSplitIdx, 'String', {'All'}, 'Value', 1, 'Enable', 'off');
-                set(cbTileSplit, 'Value', 0); % tile off when All trials
-            case 2 % Tone
-                items = [{'All'}, cellstr(compose('Tone %d', 1:7))];
-                set(popupSplitIdx, 'String', items, 'Value', 1, 'Enable', 'on');
-            case 3 % Octave
-                items = {'All', 'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'};
-                set(popupSplitIdx, 'String', items, 'Value', 1, 'Enable', 'on');
-        end
-    end
-
     function onGroup1Changed(~, ~)
-        sanitize_popup_value(popupGroup1);
         key = canonKey(groupNames{popupGroup1.Value});
         sessions = ctxGroups.(key);
 
-        labelsOut = cell(numel(sessions), 1);
-        ids = strings(numel(sessions),1);
+        sessionLabels = build_session_labels(sessions);
+        animalLabels = unique_stable(get_session_animals(sessions));
 
-        for ii = 1:numel(sessions)
-            m = sessions(ii).meta;
-
-            id = '';
-            if isfield(m,'ID') && ~isempty(m.ID)
-                id = char(string(m.ID));
-            elseif isfield(m,'AnimalID') && ~isempty(m.AnimalID)
-                id = char(string(m.AnimalID));
-            end
-            ids(ii) = string(id);
-
-            dt = '';
-            if isfield(m,'date') && ~isempty(m.date)
-                dt = char(string(m.date));
-            end
-
-            if ~isempty(dt)
-                labelsOut{ii} = sprintf('%s | %s', id, dt);
-            else
-                labelsOut{ii} = id;
-            end
+        if isempty(sessionLabels)
+            sessionLabels = {'<no session>'};
+        end
+        if isempty(animalLabels)
+            animalLabels = {'<none>'};
         end
 
-        if isempty(labelsOut)
-            labelsOut = {'<no session>'};
-        end
-        set_listbox_contents(listSessions1, labelsOut, 1);
+        set(listSessions1, 'String', sessionLabels, ...
+            'Value', valid_multi_selection(numel(sessionLabels), true));
+        set_animal_table(listAnimals1, animalLabels, true);
 
-        uIDs = unique(ids, 'stable');
-        uIDs(uIDs=="") = [];
-        if isempty(uIDs)
-            set_listbox_contents(listAnimals1, {'<no animal>'}, 1);
-        else
-            set_listbox_contents(listAnimals1, cellstr(uIDs), []);
-        end
+        onSplitModeChanged();
     end
 
     function onGroup2Changed(~, ~)
-        sanitize_popup_value(popupGroup2);
-        idxG2 = popupGroup2.Value;
-        if idxG2 <= 1
-            set_listbox_contents(listAnimals2, {'<none>'}, 1);
-            set(listAnimals2, 'Enable', 'off');
+        [~, sessions] = get_group2_selection();
+        animalLabels = unique_stable(get_session_animals(sessions));
+        if isempty(animalLabels)
+            animalLabels = {'<none>'};
+        end
+
+        set_animal_table(listAnimals2, animalLabels, true);
+    end
+
+    function onSplitModeChanged(~, ~)
+        switch get(popupSplitMode, 'Value')
+            case 1
+                set(popupSplitIdx, 'String', {'All'}, 'Value', 1, 'Enable', 'off');
+                set(cbTileSplit, 'Value', 0);
+            case 2
+                set(popupSplitIdx, 'String', [{'All'}, cellstr(compose('Tone %d', 1:7))], ...
+                    'Value', 1, 'Enable', 'on');
+            case 3
+                set(popupSplitIdx, 'String', {'All', 'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'}, ...
+                    'Value', 1, 'Enable', 'on');
+        end
+    end
+
+    function onApplyAxes(~, ~)
+        xmin = str2double(get(editXmin, 'String'));
+        xmax = str2double(get(editXmax, 'String'));
+        ymin = str2double(get(editYmin, 'String'));
+        ymax = str2double(get(editYmax, 'String'));
+
+        if any(isnan([xmin xmax ymin ymax])) || xmin >= xmax || ymin >= ymax
             return;
         end
 
-        keyG2 = canonKey(groupNames2{idxG2});
-        sessions = ctxGroups.(keyG2);
+        state.currentXLim = [xmin xmax];
+        state.currentYLim = [ymin ymax];
+        state.manualAxes = true;
 
-        ids = strings(numel(sessions),1);
-        for ii = 1:numel(sessions)
-            m = sessions(ii).meta;
-            if isfield(m,'ID') && ~isempty(m.ID)
-                ids(ii) = string(m.ID);
-            elseif isfield(m,'AnimalID') && ~isempty(m.AnimalID)
-                ids(ii) = string(m.AnimalID);
-            else
-                ids(ii) = "Unknown";
-            end
-        end
-
-        uIDs = unique(ids, 'stable');
-        if isempty(uIDs)
-            set_listbox_contents(listAnimals2, {'<no animal>'}, 1);
-            set(listAnimals2, 'Enable', 'on');
-        else
-            set_listbox_contents(listAnimals2, cellstr(uIDs), []);
-            set(listAnimals2, 'Enable', 'on');
-        end
+        apply_axes_state(mainAxes);
     end
 
     function onPickColorG1(~, ~)
         key = canonKey(groupNames{popupGroup1.Value});
         cmap = getappdata(fig, 'groupColorMap');
         f = keyField(key);
-        c0 = cmap.(f);
+        if ~isfield(cmap, f)
+            cmap.(f) = get_base_color_from_key(key);
+        end
 
-        c = uisetcolor(c0, sprintf('Pick color for Group 1: %s', key));
-        if numel(c)==3
-            cmap.(f) = c;
+        picked = uisetcolor(cmap.(f), sprintf('Pick color for Group 1: %s', key));
+        if numel(picked) == 3
+            cmap.(f) = picked;
             setappdata(fig, 'groupColorMap', cmap);
         end
     end
 
     function onPickColorG2(~, ~)
-        idxG2 = popupGroup2.Value;
-        if idxG2 <= 1
-            warndlg('Group 2 is <none>. Please select a real Group 2 first.', 'Group 2');
+        idx = popupGroup2.Value;
+        if idx <= 1
             return;
         end
 
-        key = canonKey(groupNames2{idxG2});
+        key = canonKey(groupNames2{idx});
         cmap = getappdata(fig, 'groupColorMap');
         f = keyField(key);
-        c0 = cmap.(f);
+        if ~isfield(cmap, f)
+            cmap.(f) = get_base_color_from_key(key);
+        end
 
-        c = uisetcolor(c0, sprintf('Pick color for Group 2: %s', key));
-        if numel(c)==3
-            cmap.(f) = c;
+        picked = uisetcolor(cmap.(f), sprintf('Pick color for Group 2: %s', key));
+        if numel(picked) == 3
+            cmap.(f) = picked;
             setappdata(fig, 'groupColorMap', cmap);
         end
     end
 
     function onResetColors(~, ~)
-        auto = getappdata(fig, 'autoColorMap');
-        setappdata(fig, 'groupColorMap', auto);
-        warndlg('Colors reset to auto palette.', 'Colors');
-    end
-
-    function onApplyAxes(~, ~)
-        xmin = str2double(editXmin.String);
-        xmax = str2double(editXmax.String);
-        ymin = str2double(editYmin.String);
-        ymax = str2double(editYmax.String);
-
-        if isnan(xmin) || isnan(xmax) || isnan(ymin) || isnan(ymax) || xmin >= xmax || ymin >= ymax
-            warndlg('Invalid axis limits.', 'Axis');
-            return;
-        end
-
-        currentXLim = [xmin xmax];
-        currentYLim = [ymin ymax];
-        manualAxes  = true;
-
-        if ~isempty(mainAx) && isgraphics(mainAx)
-            set(mainAx,'XLim',currentXLim,'YLim',currentYLim,'XLimMode','manual','YLimMode','manual');
-        end
+        setappdata(fig, 'groupColorMap', getappdata(fig, 'autoColorMap'));
     end
 
     function onSaveFigure(~, ~)
-        [file, path] = uiputfile({'*.png';'*.pdf'}, 'Save main plot');
-        if isequal(file,0), return; end
-        fullpath = fullfile(path, file);
-        [~,~,ext] = fileparts(fullpath);
+        [fileName, filePath] = uiputfile({'*.png'; '*.pdf'; '*.fig'}, 'Save figure as');
+        if isequal(fileName, 0)
+            return;
+        end
 
-        hasTL = ~isempty(findall(mainPanel, 'Type','tiledlayout'));
+        outFile = fullfile(filePath, fileName);
+        [~, ~, ext] = fileparts(outFile);
+        if isempty(ext)
+            outFile = [outFile '.png'];
+            ext = '.png';
+        end
 
         switch lower(ext)
-            case '.png'
-                if hasTL
-                    exportgraphics(mainPanel, fullpath, 'Resolution',300);
-                else
-                    exportgraphics(mainAx, fullpath, 'Resolution',300);
-                end
-            case '.pdf'
-                if hasTL
-                    exportgraphics(mainPanel, fullpath, 'ContentType','vector');
-                else
-                    exportgraphics(mainAx, fullpath, 'ContentType','vector');
-                end
+            case '.fig'
+                savefig(fig, outFile);
             otherwise
-                if hasTL
-                    exportgraphics(mainPanel, [fullpath '.png'], 'Resolution',300);
-                else
-                    exportgraphics(mainAx, [fullpath '.png'], 'Resolution',300);
-                end
+                saveas(fig, outFile);
         end
+    end
+
+    function onExportSummary(~, ~)
+        if isempty(state.lastSummaryData)
+            return;
+        end
+
+        [fileName, filePath] = uiputfile({'*.csv'}, 'Export summary CSV');
+        if isequal(fileName, 0)
+            return;
+        end
+
+        outFile = fullfile(filePath, fileName);
+        if numel(outFile) < 4 || ~strcmpi(outFile(end-3:end), '.csv')
+            outFile = [outFile '.csv'];
+        end
+
+        write_simple_csv(outFile, state.lastSummaryHeaders, state.lastSummaryData);
     end
 
     function onPlot(~, ~)
-        sanitize_popup_value(popupSplitMode);
-        sanitize_popup_value(popupSplitIdx);
-        sanitize_popup_value(popupGroup1);
-        sanitize_popup_value(popupGroup2);
-        sanitize_listbox_value(listSessions1);
-        sanitize_listbox_value(listAnimals1);
-        sanitize_listbox_value(listAnimals2);
-
-        splitMode = popupSplitMode.Value; % 1=All,2=Tone,3=Oct
-        splitIdx  = popupSplitIdx.Value;  % includes 'All' at 1 for Tone/Oct
-        doTile = (cbTileSplit.Value==1) && (splitMode~=1);
-
-        showAll = logical(cbAll.Value);
-        showHit = logical(cbHit.Value);
-        showFA  = logical(cbFA.Value);
+        showAll = logical(get(cbAll, 'Value'));
+        showHit = logical(get(cbHit, 'Value'));
+        showFA = logical(get(cbFA, 'Value'));
         if ~showAll && ~showHit && ~showFA
-            warndlg('Please select at least one trace type (All/Hit/FA).', 'Trace type');
             return;
         end
 
-        if doTile
-            plot_tiled_split_bins(splitMode); % always tile all bins
-            return;
-        end
+        reactWin = parse_window(editReactStart, editReactEnd, [0 2]);
+        rewardWin = parse_window(editRewardStart, editRewardEnd, [2 5]);
 
-        % ---- SINGLE AXES MODE: rebuild plot area ----
-        mainAx = reset_plot_area(false);
+        modeTag = get(modeBG.SelectedObject, 'Tag');
+        keyG1 = canonKey(groupNames{popupGroup1.Value});
+        sessionsG1 = get_filtered_sessions(keyG1, listSessions1, listAnimals1);
 
-        % axis limits
-        if manualAxes
-            set(mainAx,'XLim',currentXLim,'YLim',currentYLim);
+        [keyG2, sessionsG2] = get_group2_selection();
+        sessionsG2 = filter_sessions_by_animals(sessionsG2, listAnimals2);
+
+        splitModeValue = get(popupSplitMode, 'Value');
+        splitIdxValue = get(popupSplitIdx, 'Value');
+        tileSplit = logical(get(cbTileSplit, 'Value')) && splitModeValue ~= 1;
+
+        if tileSplit
+            [splitLabels, splitIdxList] = split_bin_labels(splitModeValue);
         else
-            set(mainAx,'XLim',defaultXLim,'YLim',defaultYLim);
-        end
-        set(mainAx,'XLimMode','manual','YLimMode','manual');
-
-        modeTag = modeBG.SelectedObject.Tag;
-
-        keyG1  = canonKey(groupNames{popupGroup1.Value});
-        sessG1 = ctxGroups.(keyG1);
-
-        idxG2 = popupGroup2.Value;
-        keyG2 = '';
-        sessG2 = [];
-        if idxG2>1
-            keyG2 = canonKey(groupNames2{idxG2});
-            sessG2 = ctxGroups.(keyG2);
+            splitLabels = {split_label(splitModeValue, splitIdxValue)};
+            splitIdxList = splitIdxValue;
         end
 
-        cmap = getappdata(fig,'groupColorMap');
-        getGroupColor = @(k) cmap.(keyField(k));
+        mainAxes = build_plot_axes(numel(splitLabels));
+        add_plot_heading(compose_plot_heading(modeTag, keyG1, keyG2, splitModeValue, tileSplit), numel(splitLabels) > 1);
 
-        ttl = sprintf('%s | %s', upper(modeTag), split_label(splitMode, splitIdx));
-        if strcmp(modeTag,'group12')
-            if isempty(keyG2), ttl = sprintf('%s vs <none> | %s', keyG1, split_label(splitMode, splitIdx));
-            else, ttl = sprintf('%s vs %s | %s', keyG1, keyG2, split_label(splitMode, splitIdx));
-            end
-        else
-            ttl = sprintf('%s: %s | %s', modeTag, keyG1, split_label(splitMode, splitIdx));
-        end
-        title(mainAx, ttl, 'Interpreter','none');
+        summaryHeaders = {'Scope', 'Split', 'Group', 'Outcome', 'NSess', 'NTrial', 'ReactAUC', 'RewardAUC'};
+        summaryRows = cell(0, numel(summaryHeaders));
 
-        legendHandles = [];
-        legendLabels  = {};
+        for iax = 1:numel(mainAxes)
+            ax = mainAxes(iax);
+            splitLabel = splitLabels{iax};
+            splitIdxThis = splitIdxList(iax);
+            sess1This = sessionsG1;
+            sess2This = sessionsG2;
+            showLegendThisAx = (numel(mainAxes) == 1) || (iax == 1);
+            compactLegend = numel(mainAxes) > 1;
 
-        switch modeTag
-            case 'single'
-                sessIdx1 = listSessions1.Value;
-                if isempty(sessIdx1) || sessIdx1(1)==0
-                    sessIdx1 = 1:numel(sessG1);
-                end
-                baseColor = getGroupColor(keyG1);
-                cmSess = make_genotype_palette(baseColor, numel(sessIdx1));
-
-                for jj = 1:numel(sessIdx1)
-                    s = sessG1(sessIdx1(jj));
-                    subjID = get_session_id(s, sessIdx1(jj));
-
-                    [Zuse,Luse] = select_trials_with_split(s, splitMode, splitIdx);
-                    if isempty(Zuse), continue; end
-                    hitFA = get_str_field(Luse,'hitFA',size(Zuse,1),"Other");
-
-                    thisColor = cmSess(jj,:);
-
-                    if showAll
-                        y = align_at_t0(tRef, mean(Zuse,1,'omitnan'));
-                        h = plot(mainAx, tRef, y, 'Color', make_lighter(thisColor), 'LineStyle','-', 'LineWidth', LW.single);
-                        legendHandles(end+1) = h;
-                        legendLabels{end+1} = sprintf('%s | All', subjID);
-                    end
-
-                    if showHit
-                        m = hitFA=="Hit";
-                        if any(m)
-                            y = align_at_t0(tRef, mean(Zuse(m,:),1,'omitnan'));
-                            h = plot(mainAx, tRef, y, 'Color', thisColor, 'LineStyle','-', 'LineWidth', LW.single);
-                            legendHandles(end+1) = h;
-                            legendLabels{end+1} = sprintf('%s | Hit', subjID);
-                        end
-                    end
-
-                    if showFA
-                        m = hitFA=="FA";
-                        if any(m)
-                            y = align_at_t0(tRef, mean(Zuse(m,:),1,'omitnan'));
-                            h = plot(mainAx, tRef, y, '--', 'Color', make_lighter(thisColor), 'LineWidth', LW.single);
-                            legendHandles(end+1) = h;
-                            legendLabels{end+1} = sprintf('%s | FA', subjID);
-                        end
-                    end
-                end
-
-            case 'groupmean'
-                sessIdx1 = sessions_from_selected_animals(sessG1, listAnimals1);
-                if isempty(sessIdx1), sessIdx1 = 1:numel(sessG1); end
-
-                c1 = getGroupColor(keyG1);
-                cFA1 = make_lighter(c1);
-                cAll1 = [0.4 0.4 0.4];
-
-                if showAll
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'All', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y = align_at_t0(tRef, m1);
-                        h = plot(mainAx, tRef, y, 'Color', cAll1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y, s1, cAll1);
-                        legendHandles(end+1)=h; legendLabels{end+1}=sprintf('%s | All', keyG1);
-                    end
-                end
-                if showHit
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'Hit', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y = align_at_t0(tRef, m1);
-                        h = plot(mainAx, tRef, y, 'Color', c1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y, s1, c1);
-                        legendHandles(end+1)=h; legendLabels{end+1}=sprintf('%s | Hit', keyG1);
-                    end
-                end
-                if showFA
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'FA', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y = align_at_t0(tRef, m1);
-                        h = plot(mainAx, tRef, y, '--', 'Color', cFA1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y, s1, cFA1);
-                        legendHandles(end+1)=h; legendLabels{end+1}=sprintf('%s | FA', keyG1);
-                    end
-                end
-
-            case 'group12'
-                sessIdx1 = sessions_from_selected_animals(sessG1, listAnimals1);
-                if isempty(sessIdx1), sessIdx1 = 1:numel(sessG1); end
-
-                sessIdx2 = [];
-                if ~isempty(sessG2)
-                    sessIdx2 = sessions_from_selected_animals(sessG2, listAnimals2);
-                    if isempty(sessIdx2), sessIdx2 = 1:numel(sessG2); end
-                end
-
-                c1 = getGroupColor(keyG1);
-                c2 = [0.5 0.5 0.5];
-                if ~isempty(sessG2), c2 = getGroupColor(keyG2); end
-
-                cAll1 = make_lighter(make_lighter(c1));
-                cAll2 = make_lighter(make_lighter(c2));
-                cFA1  = make_lighter(c1);
-                cFA2  = make_lighter(c2);
-
-                if showAll
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'All', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y1 = align_at_t0(tRef, m1);
-                        h1 = plot(mainAx, tRef, y1, 'Color', cAll1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y1, s1, cAll1);
-                        legendHandles(end+1)=h1; legendLabels{end+1}=sprintf('%s | All', keyG1);
-                    end
-                    if ~isempty(sessG2)
-                        [m2,s2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'All', splitMode, splitIdx);
-                        if ~all(isnan(m2))
-                            y2 = align_at_t0(tRef, m2);
-                            h2 = plot(mainAx, tRef, y2, 'Color', cAll2, 'LineWidth', LW.group);
-                            add_sem_patch(mainAx, tRef, y2, s2, cAll2);
-                            legendHandles(end+1)=h2; legendLabels{end+1}=sprintf('%s | All', keyG2);
-                        end
-                    end
-                end
-
-                if showHit
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'Hit', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y1 = align_at_t0(tRef, m1);
-                        h1 = plot(mainAx, tRef, y1, 'Color', c1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y1, s1, c1);
-                        legendHandles(end+1)=h1; legendLabels{end+1}=sprintf('%s | Hit', keyG1);
-                    end
-                    if ~isempty(sessG2)
-                        [m2,s2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'Hit', splitMode, splitIdx);
-                        if ~all(isnan(m2))
-                            y2 = align_at_t0(tRef, m2);
-                            h2 = plot(mainAx, tRef, y2, 'Color', c2, 'LineWidth', LW.group);
-                            add_sem_patch(mainAx, tRef, y2, s2, c2);
-                            legendHandles(end+1)=h2; legendLabels{end+1}=sprintf('%s | Hit', keyG2);
-                        end
-                    end
-                end
-
-                if showFA
-                    [m1,s1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'FA', splitMode, splitIdx);
-                    if ~all(isnan(m1))
-                        y1 = align_at_t0(tRef, m1);
-                        h1 = plot(mainAx, tRef, y1, '--', 'Color', cFA1, 'LineWidth', LW.group);
-                        add_sem_patch(mainAx, tRef, y1, s1, cFA1);
-                        legendHandles(end+1)=h1; legendLabels{end+1}=sprintf('%s | FA', keyG1);
-                    end
-                    if ~isempty(sessG2)
-                        [m2,s2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'FA', splitMode, splitIdx);
-                        if ~all(isnan(m2))
-                            y2 = align_at_t0(tRef, m2);
-                            h2 = plot(mainAx, tRef, y2, '--', 'Color', cFA2, 'LineWidth', LW.group);
-                            add_sem_patch(mainAx, tRef, y2, s2, cFA2);
-                            legendHandles(end+1)=h2; legendLabels{end+1}=sprintf('%s | FA', keyG2);
-                        end
-                    end
-                end
-        end
-
-        if ~isempty(legendHandles)
-            legend(mainAx, legendHandles, legendLabels, 'Interpreter','none', 'Location','best');
-        end
-    end
-
-    % ============================ Tile Plot ============================
-
-    function plot_tiled_split_bins(splitMode)
-        % splitMode: 2=Tone(1..7), 3=Oct(4)
-        reset_plot_area(true); % creates tiledlayout
-
-        showAll = logical(cbAll.Value);
-        showHit = logical(cbHit.Value);
-        showFA  = logical(cbFA.Value);
-
-        modeTag = modeBG.SelectedObject.Tag;
-
-        keyG1  = canonKey(groupNames{popupGroup1.Value});
-        sessG1 = ctxGroups.(keyG1);
-
-        idxG2 = popupGroup2.Value;
-        keyG2 = ''; sessG2 = [];
-        if idxG2>1
-            keyG2 = canonKey(groupNames2{idxG2});
-            sessG2 = ctxGroups.(keyG2);
-        end
-
-        cmap = getappdata(fig,'groupColorMap');
-        getGroupColor = @(k) cmap.(keyField(k));
-        c1 = getGroupColor(keyG1);
-        c2 = [0.5 0.5 0.5];
-        if ~isempty(sessG2), c2 = getGroupColor(keyG2); end
-
-        if splitMode==2
-            nBin=7; nRow=3; nCol=3;
-            binLabel = @(k) sprintf('Tone %d', k);
-        else
-            nBin=4; nRow=2; nCol=2;
-            bn = {'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'};
-            binLabel = @(k) bn{k};
-        end
-
-        tl = tiledlayout(mainPanel, nRow, nCol, 'Padding','compact', 'TileSpacing','compact');
-
-        if strcmp(modeTag,'group12')
-            if isempty(keyG2), title(tl, sprintf('%s vs <none> | Tiled', keyG1), 'Interpreter','none');
-            else, title(tl, sprintf('%s vs %s | Tiled', keyG1, keyG2), 'Interpreter','none');
-            end
-        else
-            title(tl, sprintf('%s: %s | Tiled', modeTag, keyG1), 'Interpreter','none');
-        end
-
-        % session selection
-        switch modeTag
-            case 'single'
-                sessIdx1 = listSessions1.Value;
-                if isempty(sessIdx1) || sessIdx1(1)==0, sessIdx1 = 1:numel(sessG1); end
-            otherwise
-                sessIdx1 = sessions_from_selected_animals(sessG1, listAnimals1);
-                if isempty(sessIdx1), sessIdx1 = 1:numel(sessG1); end
-        end
-
-        sessIdx2 = [];
-        if strcmp(modeTag,'group12') && ~isempty(sessG2)
-            sessIdx2 = sessions_from_selected_animals(sessG2, listAnimals2);
-            if isempty(sessIdx2), sessIdx2 = 1:numel(sessG2); end
-        end
-
-        for b = 1:nBin
-            ax = nexttile(tl);
-            hold(ax,'on'); box(ax,'on'); grid(ax,'on');
-            xlabel(ax,'t (s)'); ylabel(ax,'z');
-            title(ax, binLabel(b), 'Interpreter','none');
-
-            if manualAxes
-                set(ax,'XLim',currentXLim,'YLim',currentYLim);
-            else
-                set(ax,'XLim',defaultXLim,'YLim',defaultYLim);
-            end
-            set(ax,'XLimMode','manual','YLimMode','manual');
+            configure_axis(ax);
 
             switch modeTag
                 case 'single'
-                    cmSess = make_genotype_palette(c1, numel(sessIdx1));
-                    for ii = 1:numel(sessIdx1)
-                        s = sessG1(sessIdx1(ii));
-                        [Zuse,Luse] = select_trials_with_split(s, splitMode, b+1); % +1 because selection list has 'All' at 1
-                        if isempty(Zuse), continue; end
-                        hitFA = get_str_field(Luse,'hitFA',size(Zuse,1),"Other");
+                    summaryRows = [summaryRows; ...
+                        plot_single_mode(ax, sess1This, keyG1, splitLabel, splitModeValue, splitIdxThis, ...
+                            showAll, showHit, showFA, reactWin, rewardWin, showLegendThisAx, compactLegend)]; %#ok<AGROW>
 
-                        if showAll
-                            y = align_at_t0(tRef, mean(Zuse,1,'omitnan'));
-                            plot(ax, tRef, y, 'Color', make_lighter(cmSess(ii,:)), 'LineWidth', LW.single);
-                        end
-                        if showHit
-                            m = hitFA=="Hit";
-                            if any(m)
-                                y = align_at_t0(tRef, mean(Zuse(m,:),1,'omitnan'));
-                                plot(ax, tRef, y, 'Color', cmSess(ii,:), 'LineWidth', LW.single);
-                            end
-                        end
-                        if showFA
-                            m = hitFA=="FA";
-                            if any(m)
-                                y = align_at_t0(tRef, mean(Zuse(m,:),1,'omitnan'));
-                                plot(ax, tRef, y, '--', 'Color', make_lighter(cmSess(ii,:)), 'LineWidth', LW.single);
-                            end
-                        end
-                    end
+                case 'groupmean'
+                    summaryRows = [summaryRows; ...
+                        plot_groupmean_mode(ax, sess1This, keyG1, splitLabel, splitModeValue, splitIdxThis, ...
+                            showAll, showHit, showFA, reactWin, rewardWin, showLegendThisAx, compactLegend)]; %#ok<AGROW>
 
-                otherwise
-                    % G1
-                    [mA1,sA1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'All', splitMode, b+1);
-                    [mH1,sH1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'Hit', splitMode, b+1);
-                    [mF1,sF1] = compute_agg_trace_with_split(sessG1, sessIdx1, 'FA',  splitMode, b+1);
+                case 'group12'
+                    summaryRows = [summaryRows; ...
+                        plot_group12_mode(ax, sess1This, keyG1, sess2This, keyG2, splitLabel, splitModeValue, splitIdxThis, ...
+                            showAll, showHit, showFA, reactWin, rewardWin, showLegendThisAx, compactLegend)]; %#ok<AGROW>
+            end
 
-                    if showAll && ~all(isnan(mA1))
-                        y = align_at_t0(tRef, mA1);
-                        cc = make_lighter(make_lighter(c1));
-                        plot(ax, tRef, y, 'Color', cc, 'LineWidth', LW.group);
-                        add_sem_patch(ax, tRef, y, sA1, cc);
-                    end
-                    if showHit && ~all(isnan(mH1))
-                        y = align_at_t0(tRef, mH1);
-                        plot(ax, tRef, y, 'Color', c1, 'LineWidth', LW.group);
-                        add_sem_patch(ax, tRef, y, sH1, c1);
-                    end
-                    if showFA && ~all(isnan(mF1))
-                        y = align_at_t0(tRef, mF1);
-                        cc = make_lighter(c1);
-                        plot(ax, tRef, y, '--', 'Color', cc, 'LineWidth', LW.group);
-                        add_sem_patch(ax, tRef, y, sF1, cc);
-                    end
+            add_reference_lines(ax);
+        end
 
-                    % G2 (only in group12)
-                    if strcmp(modeTag,'group12') && ~isempty(sessG2)
-                        [mA2,sA2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'All', splitMode, b+1);
-                        [mH2,sH2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'Hit', splitMode, b+1);
-                        [mF2,sF2] = compute_agg_trace_with_split(sessG2, sessIdx2, 'FA',  splitMode, b+1);
+        if isempty(summaryRows)
+            summaryRows = {'No data', '', '', '', 0, 0, NaN, NaN};
+        end
 
-                        if showAll && ~all(isnan(mA2))
-                            y = align_at_t0(tRef, mA2);
-                            cc = make_lighter(make_lighter(c2));
-                            plot(ax, tRef, y, 'Color', cc, 'LineWidth', LW.group);
-                            add_sem_patch(ax, tRef, y, sA2, cc);
-                        end
-                        if showHit && ~all(isnan(mH2))
-                            y = align_at_t0(tRef, mH2);
-                            plot(ax, tRef, y, 'Color', c2, 'LineWidth', LW.group);
-                            add_sem_patch(ax, tRef, y, sH2, c2);
-                        end
-                        if showFA && ~all(isnan(mF2))
-                            y = align_at_t0(tRef, mF2);
-                            cc = make_lighter(c2);
-                            plot(ax, tRef, y, '--', 'Color', cc, 'LineWidth', LW.group);
-                            add_sem_patch(ax, tRef, y, sF2, cc);
-                        end
-                    end
+        state.lastSummaryHeaders = summaryHeaders;
+        state.lastSummaryData = summaryRows;
+        set(tableSummary, 'Data', summaryRows, 'ColumnName', summaryHeaders);
+    end
+
+    function ax = build_plot_axes(nAxes)
+        delete(get(plotPanel, 'Children'));
+        delete(findall(fig, 'Type', 'legend'));
+
+        if nargin < 1 || isempty(nAxes) || nAxes < 1
+            nAxes = 1;
+        end
+
+        positions = compute_axes_positions(nAxes);
+        ax = gobjects(nAxes, 1);
+        for ii = 1:nAxes
+            ax(ii) = axes('Parent', plotPanel, ...
+                'Units', 'normalized', ...
+                'Position', positions(ii, :), ...
+                'Box', 'on', ...
+                'FontSize', 10);
+        end
+        apply_axes_state(ax);
+    end
+
+    function add_plot_heading(titleText, compactMode)
+        if nargin < 2
+            compactMode = false;
+        end
+
+        fontSize = 12;
+        fontWeight = 'bold';
+        yPos = 0.95;
+        if compactMode
+            fontSize = 11;
+            yPos = 0.965;
+        end
+
+        uicontrol(plotPanel, 'Style', 'text', ...
+            'Units', 'normalized', ...
+            'Position', [0.03 yPos 0.94 0.04], ...
+            'String', titleText, ...
+            'HorizontalAlignment', 'center', ...
+            'FontWeight', fontWeight, ...
+            'FontSize', fontSize, ...
+            'BackgroundColor', 'w');
+    end
+
+    function apply_axes_state(ax)
+        for ii = 1:numel(ax)
+            if ~ishandle(ax(ii))
+                continue;
+            end
+            if state.manualAxes
+                set(ax(ii), 'XLim', state.currentXLim, 'YLim', state.currentYLim);
+            else
+                set(ax(ii), 'XLim', defaultXLim, 'YLim', defaultYLim);
+            end
+            set(ax(ii), 'XLimMode', 'manual', 'YLimMode', 'manual');
+        end
+    end
+
+    function configure_axis(ax)
+        cla(ax, 'reset');
+        hold(ax, 'on');
+        grid(ax, 'on');
+        box(ax, 'on');
+        xlabel(ax, 'Time (s)');
+        ylabel(ax, 'z (aligned at t=0)');
+        apply_axes_state(ax);
+    end
+
+    function add_reference_lines(ax)
+        yLimits = get(ax, 'YLim');
+        xLimits = get(ax, 'XLim');
+        line(ax, [0 0], yLimits, 'Color', [0.5 0.5 0.5], 'LineStyle', '--', 'HandleVisibility', 'off');
+        line(ax, xLimits, [0 0], 'Color', [0.7 0.7 0.7], 'LineStyle', ':', 'HandleVisibility', 'off');
+    end
+
+    function rows = plot_single_mode(ax, sessions, keyG1Local, splitTitle, splitMode, splitIdx, showAllLocal, showHitLocal, showFALocal, reactWin, rewardWin, showLegend, compactLegend)
+        rows = cell(0, 8);
+
+        if isempty(sessions)
+            title(ax, splitTitle, 'Interpreter', 'none', 'FontSize', 10);
+            return;
+        end
+
+        baseColor = getGroupColor(keyG1Local);
+        cmap = make_genotype_palette(baseColor, numel(sessions));
+        legendHandles = [];
+        legendLabels = {};
+
+        for isess = 1:numel(sessions)
+            sess = sessions(isess);
+            sessLabel = build_session_label(sess, isess);
+            thisColor = cmap(isess, :);
+
+            if showAllLocal
+                [traceMean, ~, nTrials] = session_trace(sess, 'All', splitMode, splitIdx);
+                if nTrials > 0
+                    y = align_at_t0(sess.t, traceMean);
+                    h = plot(ax, sess.t, y, 'Color', thisColor, 'LineWidth', 1.4, 'LineStyle', '-');
+                    legendHandles(end+1) = h; %#ok<AGROW>
+                    legendLabels{end+1} = sprintf('%s - All %s', sessLabel, format_n_trials_label(nTrials)); %#ok<AGROW>
+                    rows(end+1, :) = build_summary_row('single', splitTitle, sessLabel, 'All', sess, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+                end
+            end
+
+            if showHitLocal
+                [traceMean, ~, nTrials] = session_trace(sess, 'Hit', splitMode, splitIdx);
+                if nTrials > 0
+                    h = plot(ax, sess.t, align_at_t0(sess.t, traceMean), ...
+                        'Color', thisColor, 'LineWidth', 1.6, 'LineStyle', '-');
+                    legendHandles(end+1) = h; %#ok<AGROW>
+                    legendLabels{end+1} = sprintf('%s - Hit %s', sessLabel, format_n_trials_label(nTrials)); %#ok<AGROW>
+                    rows(end+1, :) = build_summary_row('single', splitTitle, sessLabel, 'Hit', sess, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+                end
+            end
+
+            if showFALocal
+                [traceMean, ~, nTrials] = session_trace(sess, 'FA', splitMode, splitIdx);
+                if nTrials > 0
+                    h = plot(ax, sess.t, align_at_t0(sess.t, traceMean), ...
+                        'Color', make_lighter(thisColor), 'LineWidth', 1.6, 'LineStyle', '--');
+                    legendHandles(end+1) = h; %#ok<AGROW>
+                    legendLabels{end+1} = sprintf('%s - FA %s', sessLabel, format_n_trials_label(nTrials)); %#ok<AGROW>
+                    rows(end+1, :) = build_summary_row('single', splitTitle, sessLabel, 'FA', sess, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+                end
             end
         end
+
+        apply_plot_legend(ax, legendHandles, legendLabels, showLegend, compactLegend);
+        title(ax, splitTitle, 'Interpreter', 'none', 'FontSize', 10);
     end
 
-    % ============================ Plot area reset (THE FIX) ============================
+    function rows = plot_groupmean_mode(ax, sessions, keyG1Local, splitTitle, splitMode, splitIdx, showAllLocal, showHitLocal, showFALocal, reactWin, rewardWin, showLegend, compactLegend)
+        rows = cell(0, 8);
+        legendHandles = [];
+        legendLabels = {};
 
-    function axOrEmpty = reset_plot_area(makeTile)
-        % Destroys any existing tiledlayout/axes in mainPanel and recreates
-        % either a single full-size axes OR leaves space for tiledlayout.
-        delete(findall(mainPanel, 'Type','tiledlayout'));
-        delete(findall(mainPanel, 'Type','axes'));
+        baseColor = getGroupColor(keyG1Local);
+        faColor = make_lighter(baseColor);
+        allColor = [0.35 0.35 0.35];
 
-        if makeTile
-            axOrEmpty = [];
-            % tiledlayout will be created by caller
+        if showAllLocal
+            [mTrace, sTrace, nSess] = aggregate_trace(sessions, 'All', splitMode, splitIdx);
+            if nSess > 0
+                h = plot(ax, tRef, align_at_t0(tRef, mTrace), 'Color', allColor, 'LineWidth', 1.8);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, mTrace), sTrace, allColor);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - All %s', keyG1Local, format_n_animals_label(nSess)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('groupmean', splitTitle, keyG1Local, 'All', sessions, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        if showHitLocal
+            [mTrace, sTrace, nSess] = aggregate_trace(sessions, 'Hit', splitMode, splitIdx);
+            if nSess > 0
+                h = plot(ax, tRef, align_at_t0(tRef, mTrace), 'Color', baseColor, 'LineWidth', 2.0);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, mTrace), sTrace, baseColor);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - Hit %s', keyG1Local, format_n_animals_label(nSess)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('groupmean', splitTitle, keyG1Local, 'Hit', sessions, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        if showFALocal
+            [mTrace, sTrace, nSess] = aggregate_trace(sessions, 'FA', splitMode, splitIdx);
+            if nSess > 0
+                h = plot(ax, tRef, align_at_t0(tRef, mTrace), 'Color', faColor, 'LineWidth', 2.0, 'LineStyle', '--');
+                add_sem_patch(ax, tRef, align_at_t0(tRef, mTrace), sTrace, faColor);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - FA %s', keyG1Local, format_n_animals_label(nSess)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('groupmean', splitTitle, keyG1Local, 'FA', sessions, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        apply_plot_legend(ax, legendHandles, legendLabels, showLegend, compactLegend);
+        title(ax, splitTitle, 'Interpreter', 'none', 'FontSize', 10);
+    end
+
+    function rows = plot_group12_mode(ax, sessions1, keyG1Local, sessions2, keyG2Local, splitTitle, splitMode, splitIdx, ...
+            showAllLocal, showHitLocal, showFALocal, reactWin, rewardWin, showLegend, compactLegend)
+        rows = cell(0, 8);
+        legendHandles = [];
+        legendLabels = {};
+
+        baseColor1 = getGroupColor(keyG1Local);
+        if isempty(keyG2Local)
+            baseColor2 = [0.5 0.5 0.5];
+        else
+            baseColor2 = getGroupColor(keyG2Local);
+        end
+
+        faColor1 = make_lighter(baseColor1);
+        faColor2 = make_lighter(baseColor2);
+
+        if showAllLocal
+            [m1, s1, n1] = aggregate_trace(sessions1, 'All', splitMode, splitIdx);
+            [m2, s2, n2] = aggregate_trace(sessions2, 'All', splitMode, splitIdx);
+            if n1 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m1), 'Color', [0.35 0.35 0.35], 'LineWidth', 1.8);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m1), s1, [0.35 0.35 0.35]);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - All %s', keyG1Local, format_n_animals_label(n1)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG1Local, 'All', sessions1, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+            if n2 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m2), 'Color', [0.60 0.60 0.60], 'LineWidth', 1.8);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m2), s2, [0.60 0.60 0.60]);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - All %s', keyG2Local, format_n_animals_label(n2)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG2Local, 'All', sessions2, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        if showHitLocal
+            [m1, s1, n1] = aggregate_trace(sessions1, 'Hit', splitMode, splitIdx);
+            [m2, s2, n2] = aggregate_trace(sessions2, 'Hit', splitMode, splitIdx);
+            if n1 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m1), 'Color', baseColor1, 'LineWidth', 2.0);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m1), s1, baseColor1);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - Hit %s', keyG1Local, format_n_animals_label(n1)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG1Local, 'Hit', sessions1, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+            if n2 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m2), 'Color', baseColor2, 'LineWidth', 2.0);
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m2), s2, baseColor2);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - Hit %s', keyG2Local, format_n_animals_label(n2)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG2Local, 'Hit', sessions2, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        if showFALocal
+            [m1, s1, n1] = aggregate_trace(sessions1, 'FA', splitMode, splitIdx);
+            [m2, s2, n2] = aggregate_trace(sessions2, 'FA', splitMode, splitIdx);
+            if n1 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m1), 'Color', faColor1, 'LineWidth', 2.0, 'LineStyle', '--');
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m1), s1, faColor1);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - FA %s', keyG1Local, format_n_animals_label(n1)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG1Local, 'FA', sessions1, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+            if n2 > 0
+                h = plot(ax, tRef, align_at_t0(tRef, m2), 'Color', faColor2, 'LineWidth', 2.0, 'LineStyle', '--');
+                add_sem_patch(ax, tRef, align_at_t0(tRef, m2), s2, faColor2);
+                legendHandles(end+1) = h; %#ok<AGROW>
+                legendLabels{end+1} = sprintf('%s - FA %s', keyG2Local, format_n_animals_label(n2)); %#ok<AGROW>
+                rows(end+1, :) = build_summary_row('group12', splitTitle, keyG2Local, 'FA', sessions2, splitMode, splitIdx, reactWin, rewardWin); %#ok<AGROW>
+            end
+        end
+
+        apply_plot_legend(ax, legendHandles, legendLabels, showLegend, compactLegend);
+
+        if isempty(keyG2Local)
+            title(ax, splitTitle, 'Interpreter', 'none', 'FontSize', 10);
+        else
+            title(ax, splitTitle, 'Interpreter', 'none', 'FontSize', 10);
+        end
+    end
+
+    function rows = build_summary_row(scopeLabel, splitLabel, groupLabel, outcomeName, sessions, splitMode, splitIdx, reactWin, rewardWin)
+        if isempty(sessions)
+            rows = {scopeLabel, splitLabel, groupLabel, outcomeName, 0, 0, NaN, NaN};
             return;
         end
 
-        axOrEmpty = axes('Parent', mainPanel, ...
-            'Units','normalized', ...
-            'Position',[0.08 0.08 0.9 0.88], ...
-            'ActivePositionProperty','position');
-        hold(axOrEmpty,'on'); box(axOrEmpty,'on'); grid(axOrEmpty,'on');
-        xlabel(axOrEmpty,'Time (s)');
-        ylabel(axOrEmpty,'z (baseline-centered; aligned at t=0)');
-        set(axOrEmpty,'XLimMode','manual','YLimMode','manual');
+        [reactAUC, rewardAUC, nTrials] = compute_auc_summary(sessions, outcomeName, splitMode, splitIdx, reactWin, rewardWin);
+        rows = {scopeLabel, splitLabel, groupLabel, outcomeName, numel(sessions), nTrials, reactAUC, rewardAUC};
     end
 
-    % ============================ Split helpers ============================
+    function [keyOut, sessionsOut] = get_group2_selection()
+        idx = popupGroup2.Value;
+        if idx <= 1
+            keyOut = '';
+            sessionsOut = struct([]);
+            return;
+        end
+        keyOut = canonKey(groupNames2{idx});
+        sessionsOut = ctxGroups.(keyOut);
+    end
 
-    function [Zuse, Luse] = select_trials_with_split(sessionEntry, splitMode, splitIdx)
-        Z0 = sessionEntry.Z;
-        L0 = sessionEntry.labels;
+    function sessionsOut = get_filtered_sessions(groupKey, sessionCtrl, animalCtrl)
+        sessionsOut = ctxGroups.(groupKey);
 
-        if isempty(Z0)
-            Zuse = [];
-            Luse = L0;
+        keepSession = false(1, numel(sessionsOut));
+        idxSel = normalize_index_selection(sessionCtrl, numel(sessionsOut));
+        keepSession(idxSel) = true;
+        sessionsOut = sessionsOut(keepSession);
+
+        sessionsOut = filter_sessions_by_animals(sessionsOut, animalCtrl);
+    end
+
+    function colorValue = getGroupColor(key)
+        cmap = getappdata(fig, 'groupColorMap');
+        key = canonKey(key);
+        f = keyField(key);
+        if isfield(cmap, f)
+            colorValue = cmap.(f);
+        else
+            colorValue = get_base_color_from_key(key);
+        end
+    end
+
+    function apply_plot_legend(ax, legendHandles, legendLabels, showLegend, compactLegend)
+        if nargin < 4 || ~showLegend || isempty(legendHandles)
             return;
         end
 
-        nTrial = size(Z0,1);
+        if nargin >= 5 && compactLegend
+            lgd = legend(ax, legendHandles, legendLabels, ...
+                'Interpreter', 'none', ...
+                'Location', 'southoutside', ...
+                'FontSize', 7, ...
+                'Box', 'off');
+            set(lgd, 'Units', 'normalized');
+            panelPos = get(plotPanel, 'Position');
+            set(lgd, 'Position', [panelPos(1) + 0.06 * panelPos(3), ...
+                panelPos(2) + 0.01 * panelPos(4), ...
+                0.88 * panelPos(3), ...
+                0.035 * panelPos(4)]);
+        else
+            legend(ax, legendHandles, legendLabels, ...
+                'Interpreter', 'none', ...
+                'Location', 'best', ...
+                'FontSize', 8);
+        end
+    end
+end
 
-        % splitIdx meaning:
-        % - Mode1: only "All"
-        % - Tone/Oct: popupSplitIdx has 'All' at 1; bins start at 2
-        if splitMode == 1
+function sessionLabels = build_session_labels(sessions)
+    sessionLabels = cell(numel(sessions), 1);
+    for ii = 1:numel(sessions)
+        sessionLabels{ii} = build_session_label(sessions(ii), ii);
+    end
+end
+
+function label = build_session_label(sess, idx)
+    idStr = get_session_id(sess);
+    dateStr = '';
+    if isfield(sess.meta, 'date') && ~isempty(sess.meta.date)
+        dateStr = char(string(sess.meta.date));
+    end
+
+    if isempty(idStr)
+        idStr = sprintf('Session%d', idx);
+    end
+
+    if isempty(dateStr)
+        label = idStr;
+    else
+        label = sprintf('%s | %s', idStr, dateStr);
+    end
+end
+
+function animals = get_session_animals(sessions)
+    animals = cell(numel(sessions), 1);
+    for ii = 1:numel(sessions)
+        animals{ii} = get_session_id(sessions(ii));
+    end
+end
+
+function idStr = get_session_id(sess)
+    idStr = '';
+    if isfield(sess, 'meta') && isfield(sess.meta, 'ID') && ~isempty(sess.meta.ID)
+        idStr = char(string(sess.meta.ID));
+    elseif isfield(sess, 'meta') && isfield(sess.meta, 'AnimalID') && ~isempty(sess.meta.AnimalID)
+        idStr = char(string(sess.meta.AnimalID));
+    end
+end
+
+function out = unique_stable(items)
+    if isempty(items)
+        out = {};
+        return;
+    end
+    items = items(:);
+    keep = ~cellfun(@isempty, items);
+    items = items(keep);
+    if isempty(items)
+        out = {};
+        return;
+    end
+    [~, ia] = unique(items, 'stable');
+    out = items(sort(ia));
+end
+
+function idx = find_group_index(items, target)
+    idx = [];
+    if isempty(items)
+        return;
+    end
+
+    items = cellstr(string(items(:)));
+    target = canonical_group_key(target);
+    for ii = 1:numel(items)
+        if strcmp(canonical_group_key(items{ii}), target)
+            idx = ii;
+            return;
+        end
+    end
+end
+
+function set_animal_table(tbl, animalLabels, checkedByDefault)
+    if nargin < 3
+        checkedByDefault = true;
+    end
+
+    if isempty(animalLabels)
+        animalLabels = {'<none>'};
+        checkedFlags = false;
+    else
+        checkedFlags = repmat(logical(checkedByDefault), numel(animalLabels), 1);
+    end
+
+    data = cell(numel(animalLabels), 2);
+    for ii = 1:numel(animalLabels)
+        data{ii, 1} = checkedFlags(min(ii, numel(checkedFlags)));
+        data{ii, 2} = animalLabels{ii};
+    end
+    set(tbl, 'Data', data);
+end
+
+function selectedAnimals = get_checked_animals(ctrl)
+    selectedAnimals = {};
+
+    if isempty(ctrl) || ~ishandle(ctrl)
+        return;
+    end
+
+    try
+        data = get(ctrl, 'Data');
+        if iscell(data) && ~isempty(data)
+            for ii = 1:size(data, 1)
+                isChecked = false;
+                if size(data, 2) >= 1 && ~isempty(data{ii, 1})
+                    isChecked = logical(data{ii, 1});
+                end
+                if isChecked && size(data, 2) >= 2
+                    label = char(string(data{ii, 2}));
+                    if ~isempty(label) && ~strcmp(label, '<none>')
+                        selectedAnimals{end+1} = label; %#ok<AGROW>
+                    end
+                end
+            end
+            return;
+        end
+    catch
+    end
+
+    animalStrings = get(ctrl, 'String');
+    if isempty(animalStrings)
+        return;
+    end
+    if ischar(animalStrings)
+        animalStrings = cellstr(animalStrings);
+    end
+
+    idxSel = normalize_index_selection(ctrl, numel(animalStrings));
+    selectedAnimals = animalStrings(idxSel);
+end
+
+function value = valid_multi_selection(nItems, selectAll)
+    if nargin < 2
+        selectAll = false;
+    end
+    if nItems <= 0
+        value = 1;
+    elseif selectAll
+        value = 1:nItems;
+    else
+        value = 1;
+    end
+end
+
+function idxSel = normalize_index_selection(ctrl, nItems)
+    if nItems <= 0
+        idxSel = [];
+        return;
+    end
+    idxSel = get(ctrl, 'Value');
+    idxSel = idxSel(idxSel >= 1 & idxSel <= nItems);
+    if isempty(idxSel)
+        idxSel = 1:nItems;
+    end
+end
+
+function splitItems = build_split_items(sessions, splitModeValue)
+    switch splitModeValue
+        case 2
+            splitItems = unique_stable(get_session_animals(sessions));
+        case 3
+            splitItems = build_session_labels(sessions);
+        otherwise
+            splitItems = {'All selected'};
+    end
+end
+
+function label = format_n_trials_label(nTrials)
+    label = sprintf('(n=%d)', nTrials);
+end
+
+function label = format_n_animals_label(nAnimals)
+    label = sprintf('(n=%d)', nAnimals);
+end
+
+function [labels, idxList] = split_bin_labels(splitMode)
+    switch splitMode
+        case 2
+            labels = cell(1, 7);
+            idxList = 2:8;
+            for ii = 1:7
+                labels{ii} = sprintf('Tone %d', ii);
+            end
+        case 3
+            labels = {'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'};
+            idxList = 2:5;
+        otherwise
+            labels = {'All trials'};
+            idxList = 1;
+    end
+end
+
+function splitLabels = get_active_split_labels(sessions, splitModeValue, splitCtrl, tileSplit)
+    if splitModeValue == 1
+        splitLabels = {'All selected'};
+        return;
+    end
+
+    allSplit = build_split_items(sessions, splitModeValue);
+    if isempty(allSplit)
+        splitLabels = {'All selected'};
+        return;
+    end
+
+    if tileSplit
+        splitLabels = allSplit;
+    else
+        idxSel = normalize_index_selection(splitCtrl, numel(allSplit));
+        splitLabels = {allSplit{idxSel(1)}};
+    end
+end
+
+function lbl = split_label(splitMode, splitIdx)
+    switch splitMode
+        case 1
+            lbl = 'All trials';
+        case 2
+            if splitIdx == 1
+                lbl = 'All tones';
+            else
+                lbl = sprintf('Tone %d', splitIdx - 1);
+            end
+        case 3
+            if splitIdx == 1
+                lbl = 'All octaves';
+            else
+                names = {'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'};
+                kk = splitIdx - 1;
+                if kk >= 1 && kk <= numel(names)
+                    lbl = names{kk};
+                else
+                    lbl = sprintf('Oct %d', kk);
+                end
+            end
+        otherwise
+            lbl = 'All trials';
+    end
+end
+
+function [sessionsOut, titleLabel] = apply_split_filter(sessionsIn, splitModeValue, splitLabel)
+    sessionsOut = sessionsIn;
+    titleLabel = splitLabel;
+
+    if isempty(sessionsIn)
+        return;
+    end
+
+    switch splitModeValue
+        case 2
+            mask = false(1, numel(sessionsIn));
+            for ii = 1:numel(sessionsIn)
+                mask(ii) = strcmp(get_session_id(sessionsIn(ii)), splitLabel);
+            end
+            sessionsOut = sessionsIn(mask);
+            if isempty(titleLabel)
+                titleLabel = 'Animal split';
+            end
+
+        case 3
+            labels = build_session_labels(sessionsIn);
+            mask = strcmp(labels, splitLabel);
+            sessionsOut = sessionsIn(mask);
+            if isempty(titleLabel)
+                titleLabel = 'Session split';
+            end
+
+        otherwise
+            titleLabel = 'All selected';
+    end
+end
+
+function sessionsOut = filter_sessions_by_animals(sessionsIn, animalCtrl)
+    sessionsOut = sessionsIn;
+    if isempty(sessionsIn) || isempty(animalCtrl) || ~ishandle(animalCtrl)
+        return;
+    end
+
+    selectedAnimals = get_checked_animals(animalCtrl);
+    if isempty(selectedAnimals)
+        return;
+    end
+
+    keep = false(1, numel(sessionsIn));
+    for ii = 1:numel(sessionsIn)
+        keep(ii) = any(strcmp(get_session_id(sessionsIn(ii)), selectedAnimals));
+    end
+    sessionsOut = sessionsIn(keep);
+end
+
+function [traceMean, traceSem, nTrials] = session_trace(sess, outcomeName, splitMode, splitIdx)
+    if nargin < 3
+        splitMode = 1;
+        splitIdx = 1;
+    end
+    [Zsel, ~, ~] = select_trials_for_outcome(sess, outcomeName, splitMode, splitIdx);
+    nTrials = size(Zsel, 1);
+    if nTrials == 0
+        traceMean = nan(size(sess.t));
+        traceSem = nan(size(sess.t));
+        return;
+    end
+
+    traceMean = mean(Zsel, 1, 'omitnan');
+    traceSem = std(Zsel, 0, 1, 'omitnan') ./ sqrt(nTrials);
+end
+
+function [mTrace, sTrace, nSessions] = aggregate_trace(sessions, outcomeName, splitMode, splitIdx)
+    if isempty(sessions)
+        mTrace = nan(1, 0);
+        sTrace = nan(1, 0);
+        nSessions = 0;
+        return;
+    end
+
+    tRef = sessions(1).t(:)';
+    perSession = nan(numel(sessions), numel(tRef));
+
+    for ii = 1:numel(sessions)
+        [traceMean, ~, nTrials] = session_trace(sessions(ii), outcomeName, splitMode, splitIdx);
+        if nTrials > 0 && numel(traceMean) == numel(tRef)
+            perSession(ii, :) = traceMean;
+        end
+    end
+
+    valid = ~all(isnan(perSession), 2);
+    perSession = perSession(valid, :);
+    nSessions = size(perSession, 1);
+
+    if nSessions == 0
+        mTrace = nan(size(tRef));
+        sTrace = nan(size(tRef));
+        return;
+    end
+
+    mTrace = mean(perSession, 1, 'omitnan');
+    sTrace = std(perSession, 0, 1, 'omitnan') ./ sqrt(nSessions);
+end
+
+function [reactAUC, rewardAUC, nTrials] = compute_auc_summary(sessions, outcomeName, splitMode, splitIdx, reactWin, rewardWin)
+    reactAll = [];
+    rewardAll = [];
+    nTrials = 0;
+
+    for ii = 1:numel(sessions)
+        [Zsel, labelsSel, metaSel] = select_trials_for_outcome(sessions(ii), outcomeName, splitMode, splitIdx);
+        if isempty(Zsel)
+            continue;
+        end
+
+        data = struct();
+        data.z = Zsel;
+        data.t = sessions(ii).t(:)';
+        data.meta = metaSel;
+        data.labels = labelsSel;
+
+        cfg = struct();
+        cfg.winNames = {'React', 'Reward'};
+        cfg.winRanges = [reactWin; rewardWin];
+        cfg.winAreaMode = {'positive-only', 'negative-only'};
+
+        metrics = fp_calc_metrics_auc_peak(data, cfg);
+        reactAll = [reactAll; metrics.AUC_trial(:, 1)]; %#ok<AGROW>
+        rewardAll = [rewardAll; metrics.AUC_trial(:, 2)]; %#ok<AGROW>
+        nTrials = nTrials + size(Zsel, 1);
+    end
+
+    reactAUC = mean(reactAll, 'omitnan');
+    rewardAUC = mean(rewardAll, 'omitnan');
+end
+
+function [Zsel, labelsSel, metaSel] = select_trials_for_outcome(sess, outcomeName, splitMode, splitIdx)
+    if nargin < 3
+        splitMode = 1;
+        splitIdx = 1;
+    end
+
+    [Z, labelsWork] = select_trials_with_split(sess, splitMode, splitIdx);
+    nTrial = size(Z, 1);
+    hitFA = get_label_field(labelsWork, 'hitFA', nTrial, 'Other');
+
+    switch outcomeName
+        case 'Hit'
+            mask = strcmp(hitFA, 'Hit');
+        case 'FA'
+            mask = strcmp(hitFA, 'FA');
+        otherwise
+            mask = true(nTrial, 1);
+    end
+
+    Zsel = Z(mask, :);
+    labelsSel = subset_labels(labelsWork, mask, nTrial);
+    metaSel = sess.meta;
+end
+
+function [Zuse, labelsUse] = select_trials_with_split(sessionEntry, splitMode, splitIdx)
+    Z0 = sessionEntry.Z;
+    labels0 = sessionEntry.labels;
+
+    if isempty(Z0)
+        Zuse = [];
+        labelsUse = labels0;
+        return;
+    end
+
+    nTrial = size(Z0, 1);
+
+    switch splitMode
+        case 1
             idx = 1:nTrial;
-
-        elseif splitMode == 2
+        case 2
             if splitIdx == 1
-                idx = 1:nTrial;  % All tones
+                idx = 1:nTrial;
             else
-                toneK = splitIdx - 1; % 1..7
-                idx = idx_tone(sessionEntry, toneK);
+                idx = idx_tone(sessionEntry, splitIdx - 1);
             end
-
-        else % splitMode == 3
+        case 3
             if splitIdx == 1
-                idx = 1:nTrial; % All oct bins
+                idx = 1:nTrial;
             else
-                octK = splitIdx - 1; % 1..4
-                idx = idx_octave_from_tones(sessionEntry, octK);
+                idx = idx_octave_from_tones(sessionEntry, splitIdx - 1);
             end
-        end
-
-        if isempty(idx)
-            Zuse = [];
-            Luse = L0;
-            return;
-        end
-
-        Zuse = Z0(idx, :);
-        Luse = subset_labels(L0, idx, nTrial);
+        otherwise
+            idx = 1:nTrial;
     end
 
-    function idx = idx_tone(sessionEntry, toneK)
-        L = sessionEntry.labels;
+    if isempty(idx)
+        Zuse = [];
+        labelsUse = labels0;
+        return;
+    end
+
+    Zuse = Z0(idx, :);
+    labelsUse = subset_labels(labels0, idx, nTrial);
+end
+
+function idx = idx_tone(sessionEntry, toneK)
+    idx = [];
+    labelsIn = sessionEntry.labels;
+
+    toneID = get_num_field(labelsIn, {'toneID', 'tone_id', 'ToneID', 'Tone'}, []);
+    if ~isempty(toneID)
+        idx = find(toneID == toneK);
+        return;
+    end
+
+    if isfield(sessionEntry, 'Split') && ~isempty(sessionEntry.Split)
+        idx = idx_from_split_struct(sessionEntry.Split, 2, toneK);
+    end
+end
+
+function idx = idx_octave_from_tones(sessionEntry, octK)
+    idx = [];
+    labelsIn = sessionEntry.labels;
+
+    toneID = get_num_field(labelsIn, {'toneID', 'tone_id', 'ToneID', 'Tone'}, []);
+    if isempty(toneID)
+        if isfield(sessionEntry, 'Split') && ~isempty(sessionEntry.Split)
+            idx = idx_octave_from_splitTone(sessionEntry.Split, octK);
+        end
+        return;
+    end
+
+    switch octK
+        case 1
+            tones = [1 7];
+        case 2
+            tones = [2 6];
+        case 3
+            tones = [3 5];
+        case 4
+            tones = 4;
+        otherwise
+            tones = [];
+    end
+
+    if isempty(tones)
+        return;
+    end
+    idx = find(ismember(toneID, tones));
+end
+
+function idx = idx_octave_from_splitTone(splitStruct, octK)
+    idx = [];
+    toneCells = try_get_cell_idx_all(splitStruct, {'Tone', 'tone', 'toneID', 'ToneID'});
+    if isempty(toneCells) || numel(toneCells) < 7
+        return;
+    end
+
+    switch octK
+        case 1
+            ks = [1 7];
+        case 2
+            ks = [2 6];
+        case 3
+            ks = [3 5];
+        case 4
+            ks = 4;
+        otherwise
+            ks = [];
+    end
+
+    if isempty(ks)
+        return;
+    end
+
+    gathered = [];
+    for ii = 1:numel(ks)
+        kk = ks(ii);
+        if kk <= numel(toneCells) && ~isempty(toneCells{kk})
+            gathered = [gathered; toneCells{kk}(:)]; %#ok<AGROW>
+        end
+    end
+    idx = unique(gathered);
+end
+
+function idx = idx_from_split_struct(splitStruct, splitMode, splitIdx)
+    idx = [];
+    try
+        if splitMode == 2
+            idx = try_get_cell_idx(splitStruct, {'Tone', 'tone', 'toneID', 'ToneID'}, splitIdx);
+        elseif splitMode == 3
+            idx = try_get_cell_idx(splitStruct, {'Octave', 'OctSym', 'octSym', 'octSymID', 'OctSymID'}, splitIdx);
+        end
+    catch
         idx = [];
-
-        toneID = get_num_field(L, {'toneID','tone_id','ToneID','Tone'}, []);
-        if ~isempty(toneID)
-            idx = find(toneID == toneK);
-            return;
-        end
-
-        if isfield(sessionEntry,'Split') && ~isempty(sessionEntry.Split)
-            idx = idx_from_split_struct(sessionEntry.Split, 2, toneK);
-        end
     end
+end
 
-    function idx = idx_octave_from_tones(sessionEntry, octK)
-        L = sessionEntry.labels;
-        idx = [];
-
-        toneID = get_num_field(L, {'toneID','tone_id','ToneID','Tone'}, []);
-        if isempty(toneID)
-            if isfield(sessionEntry,'Split') && ~isempty(sessionEntry.Split)
-                idx = idx_octave_from_splitTone(sessionEntry.Split, octK);
+function idx = try_get_cell_idx(splitStruct, fieldCandidates, k)
+    idx = [];
+    for ii = 1:numel(fieldCandidates)
+        fn = fieldCandidates{ii};
+        if isfield(splitStruct, fn)
+            value = splitStruct.(fn);
+            if isstruct(value) && isfield(value, 'All') && iscell(value.All) && numel(value.All) >= k
+                idx = value.All{k};
+                return;
             end
-            return;
-        end
-
-        switch octK
-            case 1, tones = [1 7];
-            case 2, tones = [2 6];
-            case 3, tones = [3 5];
-            case 4, tones = 4;
-            otherwise, tones = [];
-        end
-        if isempty(tones), return; end
-        idx = find(ismember(toneID, tones));
-    end
-
-    function idx = idx_octave_from_splitTone(Split, octK)
-        idx = [];
-        toneCells = try_get_cell_idx_all(Split, {'Tone','tone','toneID','ToneID'});
-        if isempty(toneCells) || numel(toneCells) < 7, return; end
-
-        switch octK
-            case 1, ks = [1 7];
-            case 2, ks = [2 6];
-            case 3, ks = [3 5];
-            case 4, ks = 4;
-            otherwise, ks = [];
-        end
-        if isempty(ks), return; end
-
-        tmp = [];
-        for kk = ks
-            if kk<=numel(toneCells) && ~isempty(toneCells{kk})
-                tmp = [tmp; toneCells{kk}(:)]; 
-            end
-        end
-        idx = unique(tmp);
-    end
-
-    function idx = idx_from_split_struct(Split, splitMode, splitIdx)
-        idx = [];
-        try
-            if splitMode == 2
-                idx = try_get_cell_idx(Split, {'Tone','tone','toneID','ToneID'}, splitIdx);
-            elseif splitMode == 3
-                idx = try_get_cell_idx(Split, {'Octave','OctSym','octSym','octSymID','OctSymID'}, splitIdx);
-            end
-        catch
-            idx = [];
-        end
-    end
-
-    function idx = try_get_cell_idx(Split, fieldCandidates, k)
-        idx = [];
-        for ii = 1:numel(fieldCandidates)
-            fn = fieldCandidates{ii};
-            if isfield(Split, fn)
-                S = Split.(fn);
-                if isstruct(S) && isfield(S,'All') && iscell(S.All) && numel(S.All) >= k
-                    idx = S.All{k}; return;
-                end
-                if iscell(S) && numel(S) >= k
-                    idx = S{k}; return;
-                end
-            end
-        end
-    end
-
-    function cells = try_get_cell_idx_all(Split, fieldCandidates)
-        cells = {};
-        for ii = 1:numel(fieldCandidates)
-            fn = fieldCandidates{ii};
-            if isfield(Split, fn)
-                S = Split.(fn);
-                if isstruct(S) && isfield(S,'All') && iscell(S.All)
-                    cells = S.All; return;
-                end
-                if iscell(S)
-                    cells = S; return;
-                end
-            end
-        end
-    end
-
-    function v = get_num_field(L, candidates, defaultVal)
-        v = defaultVal;
-        for ii = 1:numel(candidates)
-            fn = candidates{ii};
-            if isfield(L, fn) && ~isempty(L.(fn))
-                v = double(L.(fn)(:));
+            if iscell(value) && numel(value) >= k
+                idx = value{k};
                 return;
             end
         end
     end
+end
 
-    function L2 = subset_labels(L, idx, nTrial)
-        L2 = L;
-        fns = fieldnames(L2);
-        for ff = 1:numel(fns)
-            fn = fns{ff};
-            v  = L2.(fn);
-            try
-                if isvector(v) && numel(v) == nTrial
-                    L2.(fn) = v(idx);
-                elseif ismatrix(v) && size(v,1) == nTrial
-                    L2.(fn) = v(idx, :);
-                end
-            catch
+function cells = try_get_cell_idx_all(splitStruct, fieldCandidates)
+    cells = {};
+    for ii = 1:numel(fieldCandidates)
+        fn = fieldCandidates{ii};
+        if isfield(splitStruct, fn)
+            value = splitStruct.(fn);
+            if isstruct(value) && isfield(value, 'All') && iscell(value.All)
+                cells = value.All;
+                return;
+            end
+            if iscell(value)
+                cells = value;
+                return;
             end
         end
     end
+end
 
-    function lbl = split_label(splitMode, splitIdx)
-        switch splitMode
-            case 1
-                lbl = 'All trials';
-            case 2
-                if splitIdx==1, lbl='All tones';
-                else, lbl = sprintf('Tone %d', splitIdx-1);
-                end
-            case 3
-                if splitIdx==1
-                    lbl='All octaves';
+function values = get_num_field(labelsStruct, candidates, defaultVal)
+    values = defaultVal;
+    for ii = 1:numel(candidates)
+        fn = candidates{ii};
+        if isfield(labelsStruct, fn) && ~isempty(labelsStruct.(fn))
+            values = double(labelsStruct.(fn)(:));
+            return;
+        end
+    end
+end
+
+function labelsOut = subset_labels(labelsIn, mask, nTrial)
+    labelsOut = labelsIn;
+    fns = fieldnames(labelsIn);
+    for ii = 1:numel(fns)
+        fn = fns{ii};
+        value = labelsIn.(fn);
+        try
+            if isvector(value) && numel(value) == nTrial
+                labelsOut.(fn) = value(mask);
+            elseif size(value, 1) == nTrial
+                labelsOut.(fn) = value(mask, :);
+            end
+        catch
+        end
+    end
+end
+
+function labels = get_label_field(labelsStruct, fieldName, nTrial, defaultValue)
+    if isfield(labelsStruct, fieldName) && ~isempty(labelsStruct.(fieldName))
+        raw = labelsStruct.(fieldName);
+        if iscell(raw)
+            labels = raw(:);
+        else
+            labels = cellstr(string(raw(:)));
+        end
+        if numel(labels) ~= nTrial
+            labels = repmat({defaultValue}, nTrial, 1);
+        end
+    else
+        labels = repmat({defaultValue}, nTrial, 1);
+    end
+end
+
+function yAligned = align_at_t0(t, y)
+    if isempty(t) || isempty(y) || all(isnan(y))
+        yAligned = y;
+        return;
+    end
+
+    [~, idx0] = min(abs(t));
+    if isempty(idx0) || isnan(y(idx0))
+        yAligned = y;
+    else
+        yAligned = y - y(idx0);
+    end
+end
+
+function add_sem_patch(ax, t, yMean, ySem, colorValue)
+    if isempty(yMean) || isempty(ySem) || all(isnan(ySem))
+        return;
+    end
+
+    upper = yMean + ySem;
+    lower = yMean - ySem;
+    patch(ax, [t fliplr(t)], [upper fliplr(lower)], colorValue, ...
+        'FaceAlpha', 0.18, ...
+        'EdgeColor', 'none', ...
+        'HandleVisibility', 'off');
+end
+
+function colorValue = get_base_color_from_key(keyStr)
+    keyStr = canonical_group_key(keyStr);
+    if isempty(keyStr)
+        colorValue = [0.3 0.3 0.3];
+    elseif strncmp(keyStr, 'WT_', 3)
+        colorValue = [0.00 0.45 0.74];
+    elseif strncmp(keyStr, 'FX_', 3)
+        colorValue = [0.85 0.33 0.10];
+    else
+        colorValue = [0.3 0.3 0.3];
+    end
+end
+
+function colorValue = get_alt_color_same_genotype(keyStr)
+    keyStr = canonical_group_key(keyStr);
+    if isempty(keyStr)
+        colorValue = [0.55 0.55 0.55];
+    elseif strncmp(keyStr, 'WT_', 3)
+        colorValue = [0.30 0.75 0.93];
+    elseif strncmp(keyStr, 'FX_', 3)
+        colorValue = [0.93 0.69 0.13];
+    else
+        colorValue = [0.55 0.55 0.55];
+    end
+end
+
+function tf = same_genotype_from_keys(key1, key2)
+    key1 = canonical_group_key(key1);
+    key2 = canonical_group_key(key2);
+    if isempty(key1) || isempty(key2)
+        tf = false;
+        return;
+    end
+    tf = (strncmp(key1, 'WT_', 3) && strncmp(key2, 'WT_', 3)) || ...
+         (strncmp(key1, 'FX_', 3) && strncmp(key2, 'FX_', 3));
+end
+
+function lighter = make_lighter(baseColor)
+    lighter = 0.55 * [1 1 1] + 0.45 * baseColor;
+end
+
+function cmap = make_genotype_palette(baseColor, n)
+    if n <= 1
+        cmap = baseColor;
+        return;
+    end
+    cmap = zeros(n, 3);
+    for ii = 1:n
+        alpha = (ii - 1) / max(1, n - 1);
+        cmap(ii, :) = (1 - alpha) * [0.95 0.95 0.95] + alpha * baseColor;
+    end
+end
+
+function cmapStruct = build_group_color_map(gNames)
+    gNames = cellstr(gNames(:));
+    wtIdx = [];
+    fxIdx = [];
+    unkIdx = [];
+
+    for ii = 1:numel(gNames)
+        key = canonical_group_key(gNames{ii});
+        if strncmp(key, 'WT_', 3)
+            wtIdx(end+1) = ii; %#ok<AGROW>
+        elseif strncmp(key, 'FX_', 3)
+            fxIdx(end+1) = ii; %#ok<AGROW>
+        else
+            unkIdx(end+1) = ii; %#ok<AGROW>
+        end
+    end
+
+    cmapStruct = struct();
+
+    if ~isempty(wtIdx)
+        hues = linspace(0.55, 0.75, numel(wtIdx));
+        sats = linspace(0.75, 0.95, numel(wtIdx));
+        vals = linspace(0.85, 0.70, numel(wtIdx));
+        for ii = 1:numel(wtIdx)
+            key = canonical_group_key(gNames{wtIdx(ii)});
+            cmapStruct.(matlab.lang.makeValidName(key)) = hsv2rgb([hues(ii), sats(ii), vals(ii)]);
+        end
+    end
+
+    if ~isempty(fxIdx)
+        hues = linspace(0.02, 0.12, numel(fxIdx));
+        sats = linspace(0.80, 0.98, numel(fxIdx));
+        vals = linspace(0.90, 0.75, numel(fxIdx));
+        for ii = 1:numel(fxIdx)
+            key = canonical_group_key(gNames{fxIdx(ii)});
+            cmapStruct.(matlab.lang.makeValidName(key)) = hsv2rgb([hues(ii), sats(ii), vals(ii)]);
+        end
+    end
+
+    if ~isempty(unkIdx)
+        vals = linspace(0.35, 0.75, numel(unkIdx));
+        for ii = 1:numel(unkIdx)
+            key = canonical_group_key(gNames{unkIdx(ii)});
+            cmapStruct.(matlab.lang.makeValidName(key)) = [1 1 1] * vals(ii);
+        end
+    end
+
+    for ii = 1:numel(gNames)
+        key = canonical_group_key(gNames{ii});
+        f = matlab.lang.makeValidName(key);
+        if ~isfield(cmapStruct, f)
+            cmapStruct.(f) = [0.3 0.3 0.3];
+        end
+    end
+end
+
+function key = canonical_group_key(value)
+    key = strtrim(char(string(value)));
+end
+
+function positions = compute_axes_positions(nAxes)
+    nCols = ceil(sqrt(nAxes));
+    nRows = ceil(nAxes / nCols);
+
+    if nAxes == 7
+        nCols = 3;
+        nRows = 3;
+    elseif nAxes == 4
+        nCols = 2;
+        nRows = 2;
+    end
+
+    left = 0.07;
+    bottom = 0.08;
+    width = 0.88;
+    height = 0.80;
+    gapX = 0.04;
+    gapY = 0.09;
+
+    if nAxes > 1
+        bottom = 0.15;
+        height = 0.69;
+        gapY = 0.08;
+    end
+
+    cellW = (width - gapX * (nCols - 1)) / nCols;
+    cellH = (height - gapY * (nRows - 1)) / nRows;
+
+    positions = zeros(nAxes, 4);
+    idx = 1;
+    for row = 1:nRows
+        for col = 1:nCols
+            if idx > nAxes
+                return;
+            end
+            x = left + (col - 1) * (cellW + gapX);
+            y = bottom + (nRows - row) * (cellH + gapY);
+            positions(idx, :) = [x y cellW cellH];
+            idx = idx + 1;
+        end
+    end
+end
+
+function titleText = compose_plot_heading(modeTag, keyG1, keyG2, splitMode, tileSplit)
+    splitName = split_mode_name(splitMode);
+    if tileSplit
+        splitPart = [splitName ' tiles'];
+    else
+        splitPart = splitName;
+    end
+
+    switch modeTag
+        case 'single'
+            titleText = sprintf('Single session: %s | %s', keyG1, splitPart);
+        case 'groupmean'
+            titleText = sprintf('Group mean: %s | %s', keyG1, splitPart);
+        case 'group12'
+            if isempty(keyG2)
+                titleText = sprintf('%s vs <none> | %s', keyG1, splitPart);
+            else
+                titleText = sprintf('%s vs %s | %s', keyG1, keyG2, splitPart);
+            end
+        otherwise
+            titleText = sprintf('%s | %s', keyG1, splitPart);
+    end
+end
+
+function name = split_mode_name(splitMode)
+    switch splitMode
+        case 1
+            name = 'All trials';
+        case 2
+            name = 'Tone';
+        case 3
+            name = 'Octave';
+        otherwise
+            name = 'Split';
+    end
+end
+
+function win = parse_window(startCtrl, endCtrl, fallback)
+    win = [str2double(get(startCtrl, 'String')), str2double(get(endCtrl, 'String'))];
+    if any(isnan(win)) || win(1) >= win(2)
+        win = fallback;
+    end
+end
+
+function write_simple_csv(filePath, headers, rows)
+    fid = fopen(filePath, 'w');
+    if fid < 0
+        error('fp_gui_population_viewer:ExportFailed', 'Unable to open %s for writing.', filePath);
+    end
+    cleaner = onCleanup(@() fclose(fid));
+
+    fprintf(fid, '%s\n', csv_join(headers));
+    for ii = 1:size(rows, 1)
+        fprintf(fid, '%s\n', csv_join(rows(ii, :)));
+    end
+    clear cleaner;
+end
+
+function outLine = csv_join(values)
+    escaped = cell(1, numel(values));
+    for ii = 1:numel(values)
+        value = values{ii};
+        if isnumeric(value)
+            if isscalar(value)
+                if isnan(value)
+                    token = '';
                 else
-                    names = {'Oct 1 (1&7)', 'Oct 2/3 (2&6)', 'Oct 1/3 (3&5)', 'Oct 0 (4)'};
-                    k = splitIdx-1;
-                    if k>=1 && k<=4, lbl = names{k};
-                    else, lbl = sprintf('Oct %d', k);
-                    end
+                    token = num2str(value, '%.6g');
                 end
-            otherwise
-                lbl = 'All trials';
-        end
-    end
-
-    % ============================ Core helpers ============================
-
-    function sessIdx = sessions_from_selected_animals(sessions, listHandle)
-        sessIdx = [];
-        names = string(get(listHandle,'String'));
-        sel   = sanitize_listbox_value(listHandle);
-
-        if isempty(names) || isempty(sel) || any(sel==0), return; end
-        if numel(names)==1 && (names=="<none>" || names=="<no animal>"), return; end
-
-        selIDs = names(sel);
-
-        ids = strings(numel(sessions),1);
-        for kk = 1:numel(sessions)
-            m = sessions(kk).meta;
-            if isfield(m,'ID') && ~isempty(m.ID)
-                ids(kk) = string(m.ID);
-            elseif isfield(m,'AnimalID') && ~isempty(m.AnimalID)
-                ids(kk) = string(m.AnimalID);
             else
-                ids(kk) = "Unknown";
-            end
-        end
-
-        sessIdx = find(ismember(ids, selIDs));
-    end
-
-    function sid = get_session_id(s, idxSess)
-        if isfield(s.meta,'ID') && ~isempty(s.meta.ID)
-            sid = char(string(s.meta.ID));
-        elseif isfield(s.meta,'AnimalID') && ~isempty(s.meta.AnimalID)
-            sid = char(string(s.meta.AnimalID));
-        else
-            sid = sprintf('Sess%d', idxSess);
-        end
-    end
-
-    function [mTrace, sTrace] = compute_agg_trace_with_split(sessions, sessIdx, outcomeName, splitMode, splitIdx)
-        nSessSel = numel(sessIdx);
-        if nSessSel == 0
-            mTrace = nan(size(tRef));
-            sTrace = nan(size(tRef));
-            return;
-        end
-
-        allSessMean = nan(nSessSel, numel(tRef));
-
-        for jj = 1:nSessSel
-            s = sessions(sessIdx(jj));
-            [Zuse, Luse] = select_trials_with_split(s, splitMode, splitIdx);
-            if isempty(Zuse), continue; end
-
-            nTrial = size(Zuse,1);
-            hitFA = get_str_field(Luse, 'hitFA', nTrial, "Other");
-
-            switch outcomeName
-                case 'All', mask = true(nTrial,1);
-                case 'Hit', mask = (hitFA=="Hit");
-                case 'FA',  mask = (hitFA=="FA");
-                otherwise,  mask = true(nTrial,1);
-            end
-
-            if ~any(mask), continue; end
-            allSessMean(jj,:) = mean(Zuse(mask,:), 1, 'omitnan');
-        end
-
-        validRow = ~all(isnan(allSessMean), 2);
-        if ~any(validRow)
-            mTrace = nan(size(tRef));
-            sTrace = nan(size(tRef));
-            return;
-        end
-
-        allSessMean = allSessMean(validRow, :);
-        mTrace = mean(allSessMean, 1, 'omitnan');
-        sTrace = std(allSessMean, 0, 1, 'omitnan') ./ sqrt(size(allSessMean,1));
-    end
-
-    function yAligned = align_at_t0(t, y)
-        if isempty(t) || isempty(y) || all(isnan(y))
-            yAligned = y;
-            return;
-        end
-        [~, idx0] = min(abs(t));
-        if isempty(idx0) || isnan(y(idx0))
-            yAligned = y;
-        else
-            yAligned = y - y(idx0);
-        end
-    end
-
-    function add_sem_patch(ax, t, yMean, ySem, color)
-        if all(isnan(ySem)), return; end
-        upper = yMean + ySem;
-        lower = yMean - ySem;
-        x = [t, fliplr(t)];
-        y = [upper, fliplr(lower)];
-        p = fill(ax, x, y, color, 'FaceAlpha', 0.2, 'EdgeColor', 'none', 'HandleVisibility', 'off');
-        uistack(p, 'bottom');
-    end
-
-    function s = get_str_field(labels, fn, nTrial, defaultVal)
-        if isfield(labels, fn) && ~isempty(labels.(fn))
-            v = labels.(fn);
-            if isstring(v), s = v(:);
-            elseif iscell(v), s = string(v(:));
-            else, s = string(v(:));
-            end
-            if numel(s) ~= nTrial
-                s = repmat(string(defaultVal), nTrial, 1);
+                token = '';
             end
         else
-            s = repmat(string(defaultVal), nTrial, 1);
+            token = char(string(value));
         end
+        token = strrep(token, '"', '""');
+        escaped{ii} = ['"' token '"'];
     end
-
-    function cLight = make_lighter(cBase)
-        alpha = 0.5;
-        cLight = (1-alpha)*cBase + alpha*[1 1 1];
-    end
-
-    function cmap = make_genotype_palette(baseColor, n)
-        if n <= 1
-            cmap = baseColor;
-            return;
-        end
-        cmap = zeros(n,3);
-        for k = 1:n
-            a = (k-1) / max(1, (n-1));
-            cmap(k,:) = (1-a)*[1 1 1] + a*baseColor;
-        end
-    end
-
-    function cmapStruct = build_group_color_map(gNames)
-        gNames = cellstr(gNames(:));
-        wtIdx = []; fxIdx = []; unkIdx = [];
-
-        for i = 1:numel(gNames)
-            k = canonKey(gNames{i});
-            if startsWith(k,'WT_')
-                wtIdx(end+1) = i; 
-            elseif startsWith(k,'FX_')
-                fxIdx(end+1) = i; 
-            else
-                unkIdx(end+1) = i; 
-            end
-        end
-
-        cmapStruct = struct();
-
-        if ~isempty(wtIdx)
-            hues = linspace(0.55, 0.75, numel(wtIdx));
-            sats = linspace(0.75, 0.95, numel(wtIdx));
-            vals = linspace(0.85, 0.70, numel(wtIdx));
-            for ii = 1:numel(wtIdx)
-                k = canonKey(gNames{wtIdx(ii)});
-                cmapStruct.(matlab.lang.makeValidName(k)) = hsv2rgb([hues(ii), sats(ii), vals(ii)]);
-            end
-        end
-
-        if ~isempty(fxIdx)
-            hues = linspace(0.02, 0.12, numel(fxIdx));
-            sats = linspace(0.80, 0.98, numel(fxIdx));
-            vals = linspace(0.90, 0.75, numel(fxIdx));
-            for ii = 1:numel(fxIdx)
-                k = canonKey(gNames{fxIdx(ii)});
-                cmapStruct.(matlab.lang.makeValidName(k)) = hsv2rgb([hues(ii), sats(ii), vals(ii)]);
-            end
-        end
-
-        if ~isempty(unkIdx)
-            vals = linspace(0.35, 0.75, numel(unkIdx));
-            for ii = 1:numel(unkIdx)
-                k = canonKey(gNames{unkIdx(ii)});
-                cmapStruct.(matlab.lang.makeValidName(k)) = [1 1 1]*vals(ii);
-            end
-        end
-
-        for i = 1:numel(gNames)
-            k = canonKey(gNames{i});
-            fn = matlab.lang.makeValidName(k);
-            if ~isfield(cmapStruct, fn)
-                cmapStruct.(fn) = [0.3 0.3 0.3];
-            end
-        end
-    end
-
-    function val = sanitize_popup_value(h)
-        items = get(h, 'String');
-        n = control_length(items);
-        if n < 1
-            set(h, 'String', {''}, 'Value', 1);
-            val = 1;
-            return;
-        end
-
-        val = get(h, 'Value');
-        if isempty(val) || ~isscalar(val) || ~isfinite(val)
-            val = 1;
-        end
-
-        val = max(1, min(n, round(double(val))));
-        if get(h, 'Value') ~= val
-            set(h, 'Value', val);
-        end
-    end
-
-    function val = sanitize_listbox_value(h)
-        items = get(h, 'String');
-        n = control_length(items);
-        val = get(h, 'Value');
-
-        if n < 1
-            set(h, 'String', {''}, 'Value', 1);
-            val = 1;
-            return;
-        end
-
-        if isempty(val)
-            val = [];
-            return;
-        end
-
-        val = unique(round(double(val(:)')));
-        val = val(isfinite(val) & val >= 1 & val <= n);
-
-        if isempty(val)
-            set(h, 'Value', []);
-            return;
-        end
-
-        set(h, 'Value', val);
-    end
-
-    function set_listbox_contents(h, items, defaultValue)
-        if nargin < 3
-            defaultValue = [];
-        end
-
-        if isempty(items)
-            items = {''};
-            defaultValue = 1;
-        end
-
-        set(h, 'String', items);
-
-        if isempty(defaultValue)
-            set(h, 'Value', []);
-        else
-            n = control_length(items);
-            set(h, 'Value', max(1, min(n, defaultValue)));
-        end
-    end
-
-    function n = control_length(items)
-        if ischar(items)
-            n = size(items, 1);
-        elseif isstring(items) || iscell(items)
-            n = numel(items);
-        else
-            n = numel(items);
-        end
-    end
-
+    outLine = strjoin(escaped, ',');
 end
