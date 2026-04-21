@@ -13,10 +13,12 @@ MATLAB analysis and visualization pipeline for fiber photometry session processi
 ## Repository Layout
 
 - `Run_all.m`: end-to-end starter script
-- `fp_project_setup.m`: adds the project folders to the MATLAB path
 - `Functions/`: reusable analysis and plotting helpers
 - `Debug/`: one-off debugging and inspection scripts
 - `Legacy/`: older superseded scripts kept for reference
+- `FLMM/`: active FLMM export/backend utilities
+- `fp_gui_population_viewer.m`: active population trace viewer
+- `fp_gui_flmm_viewer.m`: active interactive FLMM viewer
 - `TDTMatlabSDK/`: bundled vendor SDK dependency
 
 ## Expected Local Data Layout
@@ -45,11 +47,16 @@ Useful entrypoints:
 
 - `Run_all.m`: build session key, process sessions, launch the population viewer
 - `fp_run_all_sessions.m`: batch-process sessions into `Results/session/`
-- `fp_run_all_sessions_flmm.m`: export FLMM-ready CSV files for the FLMM workflow
+- `FLMM/fp_run_all_sessions_flmm.m`: export FLMM-ready CSV files for the FLMM workflow
+- `fp_gui_flmm_viewer.m`: interactive FLMM comparison GUI
+- `FLMM/FLMM_run_pairwise_generic.R`: generic FLMM backend used by the GUI
 - `fp_plot_all_animals_tiles.m`: generate per-animal tiled plots
-- `fp_early_vs_late.m`: run early-vs-late plotting batches
-- `fp_gui_population_viewer_1214.m`: active population viewer GUI
-- `fp_gui_population_viewer_tone_metrics_sessionkey_0114.m`: GUI with tone metrics and SessionKey integration
+- `fp_gui_population_viewer.m`: active population viewer GUI
+
+Legacy notes:
+
+- `Legacy/FLMM/`: older one-off FLMM analysis scripts kept for reference
+- `Legacy/`: superseded GUI and plotting variants
 
 ## Notes For GitHub
 
